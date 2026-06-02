@@ -1,0 +1,38 @@
+# Pure Component Critical Properties for Peng-Robinson EOS
+#
+# Sources:
+#   Tc, Pc (hydrocarbons) : Ahmed, T. - Reservoir Engineering Handbook, 5th ed.,
+#                           Elsevier (2019), Table 1-1.
+#                           Values originally from GPA Engineering Data Book.
+#   Tc, Pc (CO2, N2, H2S) : Peng, D.Y. & Robinson, D.B. (1976),
+#                           Ind. Eng. Chem. Fundam. 15(1), 59-64, Table 1.
+#   Acentric factors       : Peng & Robinson (1976), Table 1 (all components).
+#   Molecular weights      : IUPAC atomic weights (standard values).
+#
+# Units:
+#   Tc    : degrees Rankine  (°R = °F + 459.67)
+#   Pc    : psia
+#   omega : dimensionless
+#   MW    : lb/lbmol
+#
+# Notes:
+#   C7+ is always a lumped pseudo-component in real PVT reports.
+#   Its Tc, Pc, omega must be estimated from measured MW and SG using
+#   characterization correlations (e.g. Katz-Firoozabadi, Riazi-Daubert).
+#   See eos.py pseudo_components() for implementation.
+#   iC4 = isobutane (2-methylpropane)
+#   iC5 = isopentane (2-methylbutane)
+#   nC4 = n-butane, nC5 = n-pentane, nC6 = n-hexane
+#
+component,formula,MW,Tc_R,Pc_psia,omega,source_Tc_Pc,source_omega
+C1,CH4,16.043,343.00,666.4,0.0115,Ahmed(2019) Table 1-1,Peng&Robinson(1976) Table 1
+C2,C2H6,30.069,549.59,706.5,0.0908,Ahmed(2019) Table 1-1,Peng&Robinson(1976) Table 1
+C3,C3H8,44.096,665.73,616.0,0.1454,Ahmed(2019) Table 1-1,Peng&Robinson(1976) Table 1
+iC4,C4H10,58.123,734.13,527.9,0.1756,Ahmed(2019) Table 1-1,Peng&Robinson(1976) Table 1
+nC4,C4H10,58.123,765.29,550.6,0.2002,Ahmed(2019) Table 1-1,Peng&Robinson(1976) Table 1
+iC5,C5H12,72.150,828.77,490.4,0.2275,Ahmed(2019) Table 1-1,Peng&Robinson(1976) Table 1
+nC5,C5H12,72.150,845.47,488.6,0.2515,Ahmed(2019) Table 1-1,Peng&Robinson(1976) Table 1
+nC6,C6H14,86.177,913.27,436.9,0.3013,Ahmed(2019) Table 1-1,Peng&Robinson(1976) Table 1
+CO2,CO2,44.010,547.56,1069.9,0.2250,Peng&Robinson(1976) Table 1,Peng&Robinson(1976) Table 1
+N2,N2,28.014,227.16,492.4,0.0372,Peng&Robinson(1976) Table 1,Peng&Robinson(1976) Table 1
+H2S,H2S,34.082,672.12,1299.97,0.0948,Peng&Robinson(1976) Table 1,Peng&Robinson(1976) Table 1
