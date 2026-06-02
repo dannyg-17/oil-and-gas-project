@@ -436,38 +436,3 @@ def pvt_table(API, GOR, T, gas_SG, region="global", P_min=50.0, P_max=None,
     }
 
 
-# ---------------------------------------------------------------------------
-# SELF-TEST
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    API, GOR, T, gas_SG = 35, 500, 180, 0.65
-
-    print("=" * 60)
-    print("  PVT Correlations — Bubble Point Comparison")
-    print(f"  Fluid: API={API}, GOR={GOR} scf/STB, T={T}°F, gas_SG={gas_SG}")
-    print("=" * 60)
-
-    for region in REGIONS:
-        Pb = bubble_point(API, GOR, T, gas_SG, region)
-        label = REGIONS[region].split("—")[0].strip()
-        print(f"  {label:<35}  Pb = {Pb:>7.1f} psia")
-
-    print()
-    print("Running full pvt_table for 'western_usa' (Standing)...")
-    tbl = pvt_table(API, GOR, T, gas_SG, region="western_usa")
-
-    print()
-    print("Demonstrating V&B separator correction (global region)...")
-    tbl_vb_raw  = pvt_table(API, GOR, T, gas_SG, region="global")
-    tbl_vb_corr = pvt_table(API, GOR, T, gas_SG, region="global", T_sp=80.0, P_sp=50.0)
-    print(f"  Pb uncorrected : {tbl_vb_raw['Pb']:.1f} psia")
-    print(f"  Pb corrected   : {tbl_vb_corr['Pb']:.1f} psia")
-    print(f"  Pb              = {tbl['Pb']:.1f} psia")
-    print(f"  Rs at P_min     = {tbl['Rs'][0]:.1f}  scf/STB")
-    print(f"  Rs at Pb        = {tbl['Rs'][-1]:.1f}  scf/STB")
-    print(f"  Bo at P_min     = {tbl['Bo'][0]:.4f} RB/STB")
-    print(f"  Bo at Pb        = {tbl['Bo'][-1]:.4f} RB/STB")
-    print(f"  mu_o at P_min   = {tbl['mu_o'][0]:.3f} cp")
-    print(f"  mu_o at Pb      = {tbl['mu_o'][-1]:.3f} cp")
-    print("\ncorrelations.py — all functions loaded successfully.")
