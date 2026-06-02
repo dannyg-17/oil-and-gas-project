@@ -73,16 +73,6 @@ def _apply_style():
     plt.rcParams.update(_MPL_STYLE)
 
 
-def _pvt_label(property_name):
-    labels = {
-        'Rs'  : ('Solution GOR $R_s$ [scf/STB]',),
-        'Bo'  : ('Oil FVF $B_o$ [RB/STB]',),
-        'mu_o': ('Viscosity $\\mu_o$ [cp]',),
-        'Z'   : ('Z-factor [-]',),
-        'rho' : ('Density [lb/ft³]',),
-    }
-    return labels.get(property_name, (property_name,))[0]
-
 
 def _add_pb_line(ax, Pb, color='red', label=True):
     """Add vertical dashed line at bubble point."""
@@ -538,7 +528,7 @@ def plot_bo_surface(API, GOR, gas_SG,
             for j, P in enumerate(P_arr):
                 Bo_grid[i, j] = float(formation_volume_factor(
                     P, API, T, gas_SG, Pb, GOR, region=region
-                ))
+                )[0])
         except Exception:
             pass
 
@@ -571,7 +561,7 @@ def plot_viscosity_surface(API, GOR, gas_SG,
             for j, P in enumerate(P_arr):
                 mu_grid[i, j] = float(viscosity(
                     P, API, T, gas_SG, Pb, GOR, region=region
-                ))
+                )[0])
         except Exception:
             pass
 

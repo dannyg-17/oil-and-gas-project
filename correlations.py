@@ -254,7 +254,7 @@ def _rs_below_pb(P, API, T, gas_SG, region):
 
     elif region == "global":
         # Invert Vasquez & Beggs: Rs = C1 * gas_SG * P^C2 * exp(C3*API/(T+460))
-        if np.isscalar(API) and API <= 30:
+        if API <= 30:
             C1, C2, C3 = 0.0362, 1.0937, 25.724
         else:
             C1, C2, C3 = 0.0178, 1.1870, 23.931
@@ -322,7 +322,7 @@ def _bo_saturated(Rs, API, T, gas_SG, oil_SG, region):
 
     elif region == "global":
         # Vasquez & Beggs (1980)
-        if np.isscalar(API) and API <= 30:
+        if API <= 30:
             C1, C2, C3 = 4.677e-4, 1.751e-5, -1.811e-8
         else:
             C1, C2, C3 = 4.670e-4, 1.100e-5,  1.337e-9
@@ -378,9 +378,11 @@ def viscosity(P, API, T, gas_SG, Pb, GOR, region="global"):
     mu_sat = A * mu_dead ** B
 
     # Undersaturated oil (above Pb) — Vasquez & Beggs (1980)
+    # Compute mu at Pb directly (avoid recursion)
+    A_pb = 10.715 * (GOR + 100.0) ** (-0.515)
+    B_pb = 5.44   * (GOR + 150.0) ** (-0.338)
+    mu_sat_pb = float(A_pb * mu_dead ** B_pb)
     m = 2.6 * P ** 1.187 * np.exp(-11.513 - 8.98e-5 * P)
-    mu_sat_pb = float(viscosity(np.array([Pb]), API, T, gas_SG, Pb, GOR, region)[0]) \
-                if np.any(P > Pb) else mu_sat
     mu_unsat = mu_sat_pb * (P / Pb) ** m
 
     mu_o = np.where(P >= Pb, mu_unsat, mu_sat)

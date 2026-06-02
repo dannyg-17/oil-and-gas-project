@@ -502,8 +502,6 @@ with tabs[4]:
         })
         st.dataframe(mix_df, use_container_width=True, hide_index=True)
 
-        T_comp = st.session_state.get('T_comp', T)
-
         Pb_real = pr_bubble_point(mixture, T)
         st.metric("EOS Bubble Point (Wilson)", f"{Pb_real:.1f} psia")
 

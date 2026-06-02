@@ -330,19 +330,12 @@ def pr_parameters(Tc, Pc, omega, T_F):
 # ---------------------------------------------------------------------------
 
 def pr_mix(a, b, z, kij=None):
-    """
-    Van der Waals mixing rules.
-    a_mix = ΣΣ zi·zj·√(ai·aj)·(1-kij)
-    b_mix = Σ  zi·bi
-    kij defaults to zero (ideal mixing) if not supplied.
-    """
+    """Van der Waals mixing rules. kij defaults to zero (ideal mixing)."""
     n = len(z)
     if kij is None:
         kij = np.zeros((n, n))
-    a_mix = float(sum(
-        z[i] * z[j] * np.sqrt(a[i] * a[j]) * (1.0 - kij[i, j])
-        for i in range(n) for j in range(n)
-    ))
+    a_ij  = np.outer(np.sqrt(a), np.sqrt(a)) * (1.0 - kij)
+    a_mix = float(np.dot(z, a_ij @ z))
     b_mix = float(np.dot(z, b))
     return a_mix, b_mix
 
