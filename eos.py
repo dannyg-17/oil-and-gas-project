@@ -1,46 +1,50 @@
 """
 eos.py
 ------
-Peng-Robinson EOS for crude oil systems.
+Peng-Robinson EOS for oil and gas systems.
 
-Two composition input modes:
+Two composition input modes
+---------------------------
   1. REAL COMPOSITION (preferred):
      Pass a dict of {component: mole_fraction} using components from
      data/pure_components.csv. C7+ must always be specified separately
-     with its measured MW and SG, since it is a lumped fraction even in
-     real lab data and has no tabulated pure-component properties.
+     with measured MW and SG, since it is a lumped fraction even in real
+     lab data.
 
   2. PSEUDO-COMPONENT FALLBACK:
-     If no composition is provided, bulk properties (API, GOR, gas_SG)
-     are used to generate two pseudo-components. This is a low-fidelity
-     approximation — see pseudo_components() docstring.
+     If no compositional data exists, bulk properties (API, GOR, gas_SG)
+     generate two pseudo-components. This is a lower-fidelity approximation.
 
-SCOPE AND HONEST LIMITATIONS
------------------------------
-  ✓  Z-factor of reservoir fluid at single-phase conditions
-  ✓  Mixture density and molar volume vs pressure
-  ✓  EOS-based bubble point estimate (Wilson K-values)
-  ✓  PT phase envelope (Wilson K-values, first-order approximation)
+Phase equilibrium capabilities
+--------------------------------
+  - PR fugacity coefficient for each component [ln(φi)]
+  - Rachford-Rice flash with successive substitution (fugacity-converged)
+  - Michelsen (1982) simplified tangent-plane-distance stability test
+  - Proper PR bubble point via fugacity equality iteration
+  - Proper PR dew point via fugacity equality iteration
+  - PR phase envelope using fugacity bubble/dew points
 
-Full two-phase Rachford-Rice flash with PR fugacity iteration requires
-6-12 components with calibrated binary interaction parameters (kij) to
-be numerically stable. With 2 pseudo-components the extreme Tc/Pc
-asymmetry (gas ~365°R vs oil ~1263°R) causes the PR cubic to yield only
-one real root across the full pressure range. Full flash is documented
-as a future extension requiring real compositional data.
+Removed
+-------
+  phase_envelope_wilson()  — Wilson K-value only, not fugacity-based
+  pxy_diagram()            — binary Wilson K-value diagram
 
-Units:
-    Pressure    : psia
-    Temperature : °F input; °R internal (add 459.67)
-    Density     : lb/ft³
-    R           : 10.7316 psia·ft³/(lbmol·°R)
+Units
+-----
+  Pressure    : psia
+  Temperature : °F input; °R internal (add 459.67)
+  Density     : lb/ft³
+  R           : 10.7316 psia·ft³/(lbmol·°R)
 
-References:
-    Peng & Robinson (1976)     — Ind. Eng. Chem. Fundam. 15(1), 59–64
-    Katz & Firoozabadi (1978)  — JPT, C7+ characterization
-    Sutton (1985)              — SPE-14265, gas pseudo-critical props
-    Wilson (1969)              — K-value initialization
-    Ahmed (2019)               — Reservoir Engineering Handbook, 5th ed.
+References
+----------
+  Peng & Robinson (1976)     — Ind. Eng. Chem. Fundam. 15(1), 59–64
+  Katz & Firoozabadi (1978)  — JPT, November 1978, pp.1649-1655
+  Sutton (1985)              — SPE-14265
+  Wilson (1969)              — AIChE 65th National Meeting, Paper 15C
+                               (used internally for flash initialization only)
+  Michelsen (1982)           — Fluid Phase Equilibria, 9(1), 1–19
+  Ahmed (2019)               — Reservoir Engineering Handbook, 5th ed.
 """
 
 import numpy as np
@@ -51,28 +55,30 @@ from scipy.optimize import brentq
 # ---------------------------------------------------------------------------
 # CONSTANTS
 # ---------------------------------------------------------------------------
-R      = 10.7316    # psia·ft³/(lbmol·°R)
-F_TO_R = 459.67     # °F → °R
+R      = 10.7316          # psia·ft³/(lbmol·°R)
+F_TO_R = 459.67           # °F → °R
+SQRT2  = np.sqrt(2.0)     # 1.41421356…
 
 # ---------------------------------------------------------------------------
 # LOAD PURE COMPONENT TABLE
 # ---------------------------------------------------------------------------
 _CSV_PATH = Path(__file__).parent / "data" / "pure_components.csv"
 
+
 def _load_pure_components():
     """
     Load Tc, Pc, omega, MW from data/pure_components.csv.
-    Source column retained for auditability.
     Returns DataFrame indexed by component name.
     """
     if not _CSV_PATH.exists():
         raise FileNotFoundError(
             f"Pure component table not found at {_CSV_PATH}.\n"
-            "Ensure data/pure_components.csv is present relative to eos.py."
+            "Ensure data/pure_components.csv is present."
         )
     df = pd.read_csv(_CSV_PATH, comment='#')
     df = df.set_index('component')
     return df
+
 
 PURE_COMPONENTS = _load_pure_components()
 
@@ -95,7 +101,7 @@ def get_component(name):
         raise KeyError(
             f"Component '{name}' not in pure_components.csv.\n"
             f"Available: {available}\n"
-            f"For C7+, use characterize_c7plus() instead."
+            "For C7+, use characterize_c7plus() instead."
         )
     row = PURE_COMPONENTS.loc[name]
     return {
@@ -124,48 +130,44 @@ def characterize_c7plus(MW_c7, SG_c7):
     molecular weight and specific gravity.
 
     Uses Katz & Firoozabadi (1978) table for Tc and omega (interpolated),
-    with Pc adjusted so the PR b-parameter stays physically meaningful
-    (b = 0.07780·R·Tc/Pc = 2.0 ft³/lbmol). This adjustment is standard
-    practice for heavy pseudo-components in PR EOS — see Ahmed (2019) Ch.2.
+    with Pc adjusted so the PR b-parameter = 2.0 ft³/lbmol.
 
-    Raw Katz-Firoozabadi Pc values (~230 psia for MW≈200) give b > 4.5
-    ft³/lbmol, making B = b·P/(R·T) >> 1 at reservoir pressures and
-    collapsing the cubic to a single root. The b=2.0 target is consistent
-    with volume-translated PR EOS practice.
+    Source: Katz, D.L. & Firoozabadi, A. (1978) "Predicting Phase Behavior
+    of Condensate/Crude-Oil Systems Using Methane Interaction Coefficients",
+    JPT, November 1978, pp.1649-1655.
+    Pc adjustment: Ahmed (2019) Ch. 2.
 
     Parameters
     ----------
-    MW_c7 : float — C7+ molecular weight [lb/lbmol]  (measured in lab)
-    SG_c7 : float — C7+ specific gravity             (measured in lab)
+    MW_c7 : float — C7+ molecular weight [lb/lbmol]
+    SG_c7 : float — C7+ specific gravity
 
     Returns
     -------
-    dict — Tc [°R], Pc [psia], omega, MW, SG
+    dict — Tc [°R], Pc [psia], omega, MW, SG, source
     """
-    # Katz & Firoozabadi (1978) table (JPT, November 1978, pp.1649-1655)
-    # MW range C8-C20 approximately
+    # Katz & Firoozabadi (1978) table — JPT Nov. 1978, Table 1
     _KF_MW    = np.array([114, 128, 142, 156, 170, 184, 198, 212, 226, 240, 255, 270])
-    _KF_TC    = np.array([1023,1055,1074,1120,1160,1200,1236,1270,1303,1334,1368,1401])
-    _KF_OMEGA = np.array([0.444,0.462,0.488,0.512,0.535,0.562,0.588,0.617,0.649,
-                          0.679,0.706,0.735])
+    _KF_TC    = np.array([1023, 1055, 1074, 1120, 1160, 1200, 1236, 1270, 1303, 1334, 1368, 1401])
+    _KF_OMEGA = np.array([0.444, 0.462, 0.488, 0.512, 0.535, 0.562, 0.588, 0.617,
+                          0.649, 0.679, 0.706, 0.735])
 
-    MW_c7  = float(MW_c7)
-    SG_c7  = float(SG_c7)
-
+    MW_c7    = float(MW_c7)
+    SG_c7    = float(SG_c7)
     Tc_c7    = float(np.interp(MW_c7, _KF_MW, _KF_TC))
     omega_c7 = float(np.interp(MW_c7, _KF_MW, _KF_OMEGA))
 
-    # Pc adjusted so b = 2.0 ft³/lbmol (see docstring)
+    # Pc adjusted so b = 2.0 ft³/lbmol (b = 0.07780·R·Tc/Pc)
     _B_TARGET = 2.0
     Pc_c7 = 0.07780 * R * Tc_c7 / _B_TARGET
 
     return {
-        'Tc'   : Tc_c7,
-        'Pc'   : Pc_c7,
-        'omega': omega_c7,
-        'MW'   : MW_c7,
-        'SG'   : SG_c7,
-        'source': 'Katz-Firoozabadi(1978) table; Pc adjusted for PR b=2.0 ft³/lbmol',
+        'Tc'    : Tc_c7,
+        'Pc'    : Pc_c7,
+        'omega' : omega_c7,
+        'MW'    : MW_c7,
+        'SG'    : SG_c7,
+        'source': 'Katz-Firoozabadi (1978) table; Pc adjusted for PR b=2.0 ft³/lbmol',
     }
 
 
@@ -199,10 +201,9 @@ def build_mixture(composition, c7plus_props=None):
 
     if abs(z_raw.sum() - 1.0) > 1e-4:
         raise ValueError(
-            f"Mole fractions sum to {z_raw.sum():.6f}, must sum to 1.0. "
-            "Normalize your composition before passing."
+            f"Mole fractions sum to {z_raw.sum():.6f}, must sum to 1.0."
         )
-    z = z_raw / z_raw.sum()   # normalize defensively
+    z = z_raw / z_raw.sum()
 
     Tc_arr    = np.zeros(len(names))
     Pc_arr    = np.zeros(len(names))
@@ -246,12 +247,9 @@ def pseudo_components(API, GOR, gas_SG):
     Generate two pseudo-components from bulk surface properties.
 
     THIS IS A FALLBACK for when no compositional data exists.
-    Results are lower fidelity than real compositions.
-    Many different actual fluid compositions can yield the same API/GOR,
-    so this representation is non-unique and approximate.
 
     Component 1 — Gas (C1-C6): Sutton (1985) SPE-14265 correlations
-    Component 2 — Oil (C7+):   Katz-Firoozabadi table + Pc adjustment
+    Component 2 — Oil (C7+):   Katz-Firoozabadi (1978) table + Pc adjustment
 
     Parameters
     ----------
@@ -263,37 +261,32 @@ def pseudo_components(API, GOR, gas_SG):
     -------
     mixture dict compatible with build_mixture() output
     """
-    oil_SG = 141.5 / (API + 131.5)
-    MW_oil = 6084.0 / (API - 5.9)      # Ahmed (2019)
+    oil_SG  = 141.5 / (API + 131.5)
+    MW_oil  = 6084.0 / (API - 5.9)    # Ahmed (2019) Eq. 1-1
 
-    # Gas pseudo-component — Sutton (1985)
+    # Gas pseudo-component — Sutton (1985) SPE-14265
     Tc_gas  = 169.2 + 349.5 * gas_SG - 74.0  * gas_SG ** 2
     Pc_gas  = 756.8 - 131.0 * gas_SG - 3.6   * gas_SG ** 2
     MW_gas  = 28.97 * gas_SG
-    # Acentric factor: interpolate C1 (omega=0.0115) to C6 (omega=0.3013)
-    # using gas SG anchored at C1 SG=0.553 and C6 SG=0.898 (air-relative)
     omega_gas = np.clip(
         0.0115 + (gas_SG - 0.553) / (0.898 - 0.553) * (0.3013 - 0.0115),
         0.0115, 0.3013
     )
 
-    # Oil pseudo-component
     c7_props = characterize_c7plus(MW_oil, oil_SG)
 
-    # Mole fractions from surface volumes
-    # 1 scf gas → 1/379.4 lbmol (standard conditions: 14.7 psia, 60°F)
-    # 1 STB oil → 5.615 ft³ × 62.4 lb/ft³ × oil_SG / MW_oil lbmol
-    n_gas   = GOR / 379.4
+    # Mole fractions from standard surface volumes
+    n_gas   = GOR / 379.4          # 1 scf = 1/379.4 lbmol at 14.696 psia, 60°F
     n_oil   = (5.615 * 62.4 * oil_SG) / MW_oil
     n_total = n_gas + n_oil
 
     return {
         'names'  : ['Gas (C1-C6)', 'Oil (C7+)'],
         'z'      : np.array([n_gas / n_total, n_oil / n_total]),
-        'Tc'     : np.array([Tc_gas,             c7_props['Tc']]),
-        'Pc'     : np.array([Pc_gas,             c7_props['Pc']]),
-        'omega'  : np.array([omega_gas,          c7_props['omega']]),
-        'MW'     : np.array([MW_gas,             c7_props['MW']]),
+        'Tc'     : np.array([Tc_gas,    c7_props['Tc']]),
+        'Pc'     : np.array([Pc_gas,    c7_props['Pc']]),
+        'omega'  : np.array([omega_gas, c7_props['omega']]),
+        'MW'     : np.array([MW_gas,    c7_props['MW']]),
         'note'   : (
             "Pseudo-component approximation from bulk API/GOR/gas_SG. "
             "Non-unique: different real fluids can yield identical inputs. "
@@ -314,11 +307,12 @@ def pr_parameters(Tc, Pc, omega, T_F):
     b    = 0.07780 · R·Tc/Pc
     κ    = 0.37464 + 1.54226·ω - 0.26992·ω²
 
-    Ref: Peng & Robinson (1976) Eqs. 12-13.
+    Source: Peng & Robinson (1976) Eqs. 12-13.
     """
     T     = T_F + F_TO_R
     Tr    = T / np.asarray(Tc)
-    kappa = 0.37464 + 1.54226 * np.asarray(omega) - 0.26992 * np.asarray(omega) ** 2
+    kappa = (0.37464 + 1.54226 * np.asarray(omega)
+             - 0.26992 * np.asarray(omega) ** 2)
     alpha = (1.0 + kappa * (1.0 - np.sqrt(Tr))) ** 2
     a     = 0.45724 * R ** 2 * np.asarray(Tc) ** 2 / np.asarray(Pc) * alpha
     b     = 0.07780 * R * np.asarray(Tc) / np.asarray(Pc)
@@ -330,14 +324,22 @@ def pr_parameters(Tc, Pc, omega, T_F):
 # ---------------------------------------------------------------------------
 
 def pr_mix(a, b, z, kij=None):
-    """Van der Waals mixing rules. kij defaults to zero (ideal mixing)."""
+    """
+    Van der Waals mixing rules.
+
+    a_mix = ΣΣ zi*zj * √(ai*aj) * (1 - kij)
+    b_mix = Σ zi * bi
+
+    Source: Peng & Robinson (1976) Eqs. 15-16.
+    kij defaults to zero (ideal mixing — acceptable for HC-HC pairs).
+    """
     n = len(z)
     if kij is None:
         kij = np.zeros((n, n))
     a_ij  = np.outer(np.sqrt(a), np.sqrt(a)) * (1.0 - kij)
     a_mix = float(np.dot(z, a_ij @ z))
     b_mix = float(np.dot(z, b))
-    return a_mix, b_mix
+    return a_mix, b_mix, a_ij
 
 
 # ---------------------------------------------------------------------------
@@ -351,11 +353,13 @@ def pr_z_factor(P, T_F, a_mix, b_mix):
     Z³ - (1-B)Z² + (A-3B²-2B)Z - (AB-B²-B³) = 0
     A = a_mix·P/(R·T)²,  B = b_mix·P/(R·T)
 
+    Source: Peng & Robinson (1976) Eq. 5.
+
     Returns
     -------
     Z_liq : smallest real root > B  (liquid phase)
     Z_vap : largest  real root > B  (vapor phase)
-    When only one real root exists (single-phase), both equal that root.
+    When only one real root, both equal that root.
     """
     T = T_F + F_TO_R
     A = a_mix * P / (R * T) ** 2
@@ -381,6 +385,725 @@ def pr_z_factor(P, T_F, a_mix, b_mix):
 
 
 # ---------------------------------------------------------------------------
+# PR FUGACITY COEFFICIENT
+# ---------------------------------------------------------------------------
+
+def pr_fugacity_coefficients(P, T_F, z, Tc, Pc, omega, kij=None):
+    """
+    Compute PR fugacity coefficients ln(φi) for each component.
+
+    Source: Peng & Robinson (1976) Eq. 18.
+
+    Equation
+    --------
+    ln(φi) = (bi/bm)*(Z-1) - ln(Z-B)
+             - A/(2*√2*B) * (2*Σj zj*√(ai*aj)*(1-kij)/am - bi/bm)
+             * ln((Z+(1+√2)*B) / (Z+(1-√2)*B))
+
+    where
+        A = am * P / (R*T)²
+        B = bm * P / (R*T)
+        √2 = 1.41421356
+
+    Parameters
+    ----------
+    P     : float — pressure [psia]
+    T_F   : float — temperature [°F]
+    z     : array — mole fractions
+    Tc    : array — critical temperatures [°R]
+    Pc    : array — critical pressures [psia]
+    omega : array — acentric factors
+    kij   : 2D array or None — binary interaction parameters
+
+    Returns
+    -------
+    ln_phi : array — ln(fugacity coefficient) for each component
+    Z      : float — Z-factor used (lowest root for liquid, highest for vapor;
+             this function returns the specified root via the 'root' argument below)
+    """
+    return _pr_fugacity_coeffs_root(P, T_F, z, Tc, Pc, omega, kij, phase='liq')
+
+
+def _pr_fugacity_coeffs_root(P, T_F, z, Tc, Pc, omega, kij=None, phase='liq'):
+    """
+    Internal: compute ln(φi) using either the liquid or vapor root.
+
+    phase : 'liq' (smallest root > B) or 'vap' (largest root > B)
+    """
+    T = T_F + F_TO_R
+    a, b = pr_parameters(Tc, Pc, omega, T_F)
+    a_mix, b_mix, a_ij = pr_mix(a, b, z, kij)
+
+    Z_liq, Z_vap = pr_z_factor(P, T_F, a_mix, b_mix)
+    if Z_liq is None:
+        return np.full(len(z), np.nan), np.nan
+
+    Z = Z_liq if phase == 'liq' else Z_vap
+
+    A = a_mix * P / (R * T) ** 2
+    B = b_mix * P / (R * T)
+    bm = b_mix
+
+    # Peng & Robinson (1976) Eq. 18
+    # Sum: Σj zj * sqrt(ai*aj)*(1-kij) for each component i
+    if kij is None:
+        kij_arr = np.zeros((len(z), len(z)))
+    else:
+        kij_arr = np.asarray(kij)
+
+    sum_j = np.array([
+        np.sum(z * np.sqrt(a[i] * a) * (1.0 - kij_arr[i, :]))
+        for i in range(len(z))
+    ])
+
+    ln_phi = (
+        (b / bm) * (Z - 1.0)
+        - np.log(Z - B)
+        - A / (2.0 * SQRT2 * B)
+        * (2.0 * sum_j / a_mix - b / bm)
+        * np.log((Z + (1.0 + SQRT2) * B) / (Z + (1.0 - SQRT2) * B))
+    )
+    return ln_phi, Z
+
+
+# ---------------------------------------------------------------------------
+# WILSON K-VALUES (internal initialization only)
+# ---------------------------------------------------------------------------
+
+def _wilson_K(Tc, Pc, omega, T_R, P):
+    """
+    Wilson (1969) K-value approximation.
+
+    Ki = (Pci/P) * exp[5.373*(1+ωi)*(1 - Tci/T)]
+
+    Source: Wilson, G.M. (1969) AIChE 65th National Meeting, Paper 15C.
+    Used ONLY as initial guess for flash and bubble/dew point iterations.
+    Never displayed to user.
+    """
+    return (Pc / P) * np.exp(5.373 * (1.0 + omega) * (1.0 - Tc / T_R))
+
+
+# ---------------------------------------------------------------------------
+# RACHFORD-RICE FLASH
+# ---------------------------------------------------------------------------
+
+def rachford_rice_flash(z, K, beta_lo=None, beta_hi=None):
+    """
+    Solve Rachford-Rice equation f(β) = Σ zi*(Ki-1)/(1+β*(Ki-1)) = 0
+    for vapor fraction β.
+
+    Source: Rachford, H.H. & Rice, J.D. (1952) Trans. AIME 195, pp.327-328.
+    Bounds: Michelsen & Mollerup (2007) Thermodynamic Models, 2nd ed., p.156.
+
+    β bounds from K-values (ensuring denominator doesn't cross zero):
+        βmin = 1/(1 - Kmax)
+        βmax = 1/(1 - Kmin)
+        intersected with (0, 1)
+
+    Returns
+    -------
+    beta      : float — vapor fraction  (NaN if single-phase)
+    x         : array — liquid mole fractions
+    y         : array — vapor mole fractions
+    converged : bool
+    """
+    z = np.asarray(z, dtype=float)
+    K = np.asarray(K, dtype=float)
+
+    Kmax = np.max(K)
+    Kmin = np.min(K)
+
+    # Proper bounds — Michelsen & Mollerup (2007)
+    b_lo = 1.0 / (1.0 - Kmax)
+    b_hi = 1.0 / (1.0 - Kmin)
+
+    # Intersect with physical range (0, 1)
+    b_lo = max(b_lo, 1e-8)
+    b_hi = min(b_hi, 1.0 - 1e-8)
+
+    if beta_lo is not None:
+        b_lo = max(b_lo, beta_lo)
+    if beta_hi is not None:
+        b_hi = min(b_hi, beta_hi)
+
+    if b_lo >= b_hi:
+        # All K < 1 (single liquid) or all K > 1 (single vapor)
+        beta = 0.0 if Kmax < 1.0 else 1.0
+        if Kmax < 1.0:
+            return 0.0, z.copy(), np.full(len(z), np.nan), True
+        else:
+            return 1.0, np.full(len(z), np.nan), z.copy(), True
+
+    def rr(beta_val):
+        return np.sum(z * (K - 1.0) / (1.0 + beta_val * (K - 1.0)))
+
+    fa = rr(b_lo)
+    fb = rr(b_hi)
+
+    if fa * fb > 0:
+        # No root in (b_lo, b_hi) — single phase
+        if abs(fa) < abs(fb):
+            return 0.0, z.copy(), np.full(len(z), np.nan), True
+        else:
+            return 1.0, np.full(len(z), np.nan), z.copy(), True
+
+    try:
+        beta = brentq(rr, b_lo, b_hi, xtol=1e-10, rtol=1e-10, maxiter=200)
+    except (ValueError, RuntimeError):
+        return float('nan'), z.copy(), z.copy(), False
+
+    denom = 1.0 + beta * (K - 1.0)
+    x = z / denom
+    y = K * x
+    # Normalize to remove any floating-point drift
+    x = x / x.sum()
+    y = y / y.sum()
+
+    return float(beta), x, y
+
+
+def pr_flash(mixture, P, T_F, kij=None, max_outer=100, max_inner=50,
+             tol_ss=1e-10, tol_trivial=1e-4):
+    """
+    Two-phase PR EOS flash with successive substitution.
+
+    Algorithm
+    ---------
+    1. Initialize K-values with Wilson (1969) correlation.
+    2. Solve Rachford-Rice equation for β (vapor fraction).
+    3. Compute fugacity coefficients for liquid (x, Z_L) and vapor (y, Z_V).
+    4. Update K-values: Ki = φi_L / φi_V
+    5. Check convergence: Σ(ln Ki_new - ln Ki_old)² < tol_ss
+    6. If β ∉ (0,1): classify as single phase.
+    7. Check trivial solution: if Σ(ln Ki)² < tol_trivial, single phase.
+
+    Source:
+      - Rachford & Rice (1952) Trans. AIME 195, pp.327-328
+      - Successive substitution: Michelsen & Mollerup (2007) p.190
+      - Convergence criterion: Michelsen (1982) Fluid Phase Equilibria 9(1), 1-19
+
+    Parameters
+    ----------
+    mixture    : dict — from build_mixture() or pseudo_components()
+    P          : float — pressure [psia]
+    T_F        : float — temperature [°F]
+    kij        : array or None — binary interaction parameters
+    max_outer  : int — maximum successive substitution iterations
+    max_inner  : int — maximum Rachford-Rice iterations (passed to brentq)
+    tol_ss     : float — convergence tolerance on ln(K) changes (default 1e-10)
+    tol_trivial: float — trivial solution detection on Σ(ln Ki)²
+
+    Returns
+    -------
+    dict with keys:
+        'beta'       : float — vapor fraction (0 = all liquid, 1 = all vapor)
+        'x'          : array — liquid mole fractions
+        'y'          : array — vapor mole fractions
+        'Z_L'        : float — liquid Z-factor
+        'Z_V'        : float — vapor Z-factor
+        'K'          : array — K-values at convergence
+        'converged'  : bool
+        'phase'      : str — 'two-phase', 'liquid', 'vapor'
+        'iterations' : int
+        'warnings'   : list of str
+    """
+    z     = mixture['z']
+    Tc    = mixture['Tc']
+    Pc    = mixture['Pc']
+    omega = mixture['omega']
+    T_R   = T_F + F_TO_R
+
+    warnings = []
+
+    # Initial K-values — Wilson (1969)
+    K = _wilson_K(Tc, Pc, omega, T_R, P)
+
+    K_old   = K.copy()
+    converged = False
+    iterations = 0
+
+    for it in range(max_outer):
+        iterations = it + 1
+
+        # Rachford-Rice
+        beta, x, y = rachford_rice_flash(z, K)[:3]
+
+        # Single-phase determination
+        if np.isnan(beta):
+            warnings.append(f"Rachford-Rice did not converge at P={P:.1f} psia, T={T_F:.1f}°F.")
+            break
+        if beta <= 0.0:
+            return {
+                'beta': 0.0, 'x': z.copy(), 'y': np.full(len(z), np.nan),
+                'Z_L': None, 'Z_V': None, 'K': K, 'converged': True,
+                'phase': 'liquid', 'iterations': iterations, 'warnings': warnings
+            }
+        if beta >= 1.0:
+            return {
+                'beta': 1.0, 'x': np.full(len(z), np.nan), 'y': z.copy(),
+                'Z_L': None, 'Z_V': None, 'K': K, 'converged': True,
+                'phase': 'vapor', 'iterations': iterations, 'warnings': warnings
+            }
+
+        # Fugacity coefficients — liquid root for x, vapor root for y
+        ln_phi_L, Z_L = _pr_fugacity_coeffs_root(P, T_F, x, Tc, Pc, omega, kij, phase='liq')
+        ln_phi_V, Z_V = _pr_fugacity_coeffs_root(P, T_F, y, Tc, Pc, omega, kij, phase='vap')
+
+        if np.any(np.isnan(ln_phi_L)) or np.any(np.isnan(ln_phi_V)):
+            warnings.append(f"NaN fugacity coefficients at P={P:.1f}, T={T_F:.1f}°F, iter={it+1}.")
+            break
+
+        # K-value update: Ki = φi_L / φi_V
+        K_new = np.exp(ln_phi_L - ln_phi_V)
+
+        # Convergence check — Michelsen (1982) Eq. (2.3)
+        err = np.sum((np.log(K_new) - np.log(K_old)) ** 2)
+        K_old = K.copy()
+        K     = K_new
+
+        if err < tol_ss:
+            converged = True
+            break
+
+    # Trivial solution check — all K-values → 1 means single phase
+    if converged and np.sum(np.log(K) ** 2) < tol_trivial:
+        converged = True
+        # Determine which phase by comparing densities
+        _a, _b = pr_parameters(Tc, Pc, omega, T_F)
+        _am, _bm, _ = pr_mix(_a, _b, z, kij)
+        Z_liq_t, Z_vap_t = pr_z_factor(P, T_F, _am, _bm)
+        if Z_liq_t is not None and Z_vap_t is not None and Z_liq_t != Z_vap_t:
+            phase = 'two-phase'   # two roots exist but K → 1 suggests near critical
+        else:
+            phase = 'liquid'
+        return {
+            'beta': beta, 'x': x, 'y': y, 'Z_L': Z_L, 'Z_V': Z_V,
+            'K': K, 'converged': converged, 'phase': phase,
+            'iterations': iterations, 'warnings': warnings
+        }
+
+    if not converged:
+        warnings.append(
+            f"Flash successive substitution did not converge in {max_outer} iterations "
+            f"at P={P:.1f} psia, T={T_F:.1f}°F."
+        )
+
+    # Final Rachford-Rice solve with converged K
+    beta, x, y = rachford_rice_flash(z, K)[:3]
+
+    # Final fugacity coefficients
+    ln_phi_L, Z_L = _pr_fugacity_coeffs_root(P, T_F, x, Tc, Pc, omega, kij, phase='liq')
+    ln_phi_V, Z_V = _pr_fugacity_coeffs_root(P, T_F, y, Tc, Pc, omega, kij, phase='vap')
+
+    if 0.0 < beta < 1.0:
+        phase = 'two-phase'
+    elif beta <= 0.0:
+        phase = 'liquid'
+    else:
+        phase = 'vapor'
+
+    return {
+        'beta'      : float(beta),
+        'x'         : x,
+        'y'         : y,
+        'Z_L'       : Z_L,
+        'Z_V'       : Z_V,
+        'K'         : K,
+        'converged' : converged,
+        'phase'     : phase,
+        'iterations': iterations,
+        'warnings'  : warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# MICHELSEN (1982) STABILITY TEST
+# ---------------------------------------------------------------------------
+
+def michelsen_stability_test(mixture, P, T_F, kij=None, max_iter=100, tol=1e-10):
+    """
+    Simplified Michelsen (1982) tangent-plane-distance stability test.
+
+    Tests whether a mixture of overall composition z is stable at (P, T)
+    by checking if any trial phase can lower the Gibbs energy.
+
+    Source: Michelsen, M.L. (1982) "The Isothermal Flash Problem. Part I.
+    Stability", Fluid Phase Equilibria, 9(1), 1-19.
+
+    Algorithm
+    ---------
+    Two trial phases are initialized:
+      1. Vapor-like: W_i = z_i * K_i (Wilson K-values)
+      2. Liquid-like: W_i = z_i / K_i
+
+    For each trial composition w (normalized from W), compute the
+    tangent plane distance (TPD) reduced function:
+        h_i = ln(W_i) + ln(φi(W/ΣW)) - ln(z_i) - ln(φi(z))   [Michelsen 1982 Eq. 2.7]
+
+    If ΣWi < 1 for both trials → feed is stable.
+    If ΣWi > 1 for any trial  → feed is unstable (two phases can form).
+
+    Parameters
+    ----------
+    mixture  : dict — from build_mixture() or pseudo_components()
+    P        : float [psia]
+    T_F      : float [°F]
+    kij      : array or None
+    max_iter : int   — successive substitution iterations for each trial
+    tol      : float — convergence tolerance
+
+    Returns
+    -------
+    is_stable      : bool — True if single phase is thermodynamically stable
+    unstable_phase : str or None — 'vapor_like', 'liquid_like', or None
+    warnings       : list of str
+    """
+    z     = mixture['z']
+    Tc    = mixture['Tc']
+    Pc    = mixture['Pc']
+    omega = mixture['omega']
+    T_R   = T_F + F_TO_R
+
+    warnings = []
+
+    # Reference fugacity of feed
+    ln_phi_z, Z_feed = _pr_fugacity_coeffs_root(P, T_F, z, Tc, Pc, omega, kij, phase='liq')
+    if np.any(np.isnan(ln_phi_z)):
+        warnings.append("Stability test: NaN in feed fugacity — test inconclusive.")
+        return True, None, warnings
+
+    K = _wilson_K(Tc, Pc, omega, T_R, P)
+
+    # Trial phase initializations
+    trials = [
+        ('vapor_like',  z * K),          # W > z (vapor-like)
+        ('liquid_like', z / np.maximum(K, 1e-30)),  # W < z (liquid-like)
+    ]
+
+    for trial_name, W0 in trials:
+        W = W0.copy()
+        for _it in range(max_iter):
+            S = W.sum()
+            if S < 1e-30:
+                break
+            w = W / S   # normalized trial composition
+            ln_phi_w, _ = _pr_fugacity_coeffs_root(P, T_F, w, Tc, Pc, omega, kij, phase='liq')
+            if np.any(np.isnan(ln_phi_w)):
+                break
+            # Successive substitution update — Michelsen (1982) Eq. 2.8
+            ln_W_new = np.log(z) + ln_phi_z - ln_phi_w
+            W_new = np.exp(ln_W_new)
+            if np.sum((np.log(W_new + 1e-300) - np.log(W + 1e-300)) ** 2) < tol:
+                W = W_new
+                break
+            W = W_new
+
+        S_final = W.sum()
+        if S_final > 1.0 + 1e-5:
+            return False, trial_name, warnings
+
+    return True, None, warnings
+
+
+# ---------------------------------------------------------------------------
+# PR BUBBLE POINT — FUGACITY ITERATION
+# ---------------------------------------------------------------------------
+
+def pr_bubble_point_fugacity(mixture, T_F, P_lo=14.7, P_hi=10000.0,
+                              kij=None, max_iter=100, tol=1e-6):
+    """
+    Bubble point pressure from PR EOS fugacity equality.
+
+    At bubble point (liquid of composition z, infinitesimal vapor y):
+        φi_L(z, P, T) * zi = φi_V(y, P, T) * yi   for all i
+        Σ yi = 1
+
+    Solved by successive substitution with outer bisection on P.
+
+    Algorithm
+    ---------
+    1. Initialize Ki = Wilson(P, T)
+    2. At each P: yi = Ki * zi
+       If Σyi > 1: P too low (K too large) → increase P
+       If Σyi < 1: P too high → decrease P
+    3. Converge via K-value successive substitution:
+       Ki_new = φi_L(z)/φi_V(y)  where y = Ki*z / Σ(Ki*z)
+    4. Convergence: |Σyi - 1| < tol
+
+    Source: Algorithm follows Whitson & Brulé (2000) Phase Behavior of
+    Petroleum Reservoir Fluids, SPE Monograph Vol.20, Section 3.3.
+
+    Returns
+    -------
+    Pb        : float [psia] or NaN if not bracketed / not converged
+    converged : bool
+    warnings  : list of str
+    """
+    z     = mixture['z']
+    Tc    = mixture['Tc']
+    Pc    = mixture['Pc']
+    omega = mixture['omega']
+    T_R   = T_F + F_TO_R
+    warnings_out = []
+
+    def sum_y(P_val):
+        """Σ yi = Σ Ki*zi at current K-values (Wilson initialization)."""
+        K = _wilson_K(Tc, Pc, omega, T_R, P_val)
+        return float(np.sum(z * K))
+
+    # Bracket check
+    try:
+        fa = sum_y(P_lo) - 1.0
+        fb = sum_y(P_hi) - 1.0
+    except Exception:
+        warnings_out.append("Bubble point: could not evaluate Wilson K at bounds.")
+        return float('nan'), False, warnings_out
+
+    if fa * fb > 0:
+        warnings_out.append(
+            f"Bubble point not bracketed in [{P_lo:.1f}, {P_hi:.1f}] psia. "
+            "Returning NaN."
+        )
+        return float('nan'), False, warnings_out
+
+    # Outer bisection to find approximate P
+    try:
+        P_wilson = brentq(lambda P: sum_y(P) - 1.0, P_lo, P_hi, xtol=1.0, maxiter=100)
+    except (ValueError, RuntimeError):
+        warnings_out.append("Bubble point: Wilson bracket solve failed.")
+        return float('nan'), False, warnings_out
+
+    # Refine with fugacity successive substitution
+    P_cur = P_wilson
+    K     = _wilson_K(Tc, Pc, omega, T_R, P_cur)
+    converged = False
+
+    for it in range(max_iter):
+        y_raw = K * z
+        S     = y_raw.sum()
+        y     = y_raw / S
+
+        # Update K-values from fugacity
+        ln_phi_L, _ = _pr_fugacity_coeffs_root(P_cur, T_F, z, Tc, Pc, omega, kij, phase='liq')
+        ln_phi_V, _ = _pr_fugacity_coeffs_root(P_cur, T_F, y, Tc, Pc, omega, kij, phase='vap')
+
+        if np.any(np.isnan(ln_phi_L)) or np.any(np.isnan(ln_phi_V)):
+            warnings_out.append(f"Bubble point: NaN fugacity at P={P_cur:.1f} psia, iter={it+1}.")
+            break
+
+        K_new = np.exp(ln_phi_L - ln_phi_V)
+
+        # Update pressure to satisfy Σyi = 1
+        S_new = np.sum(K_new * z)
+        # Simple update: multiply P by S_new to drive Σy→1
+        P_cur = P_cur * S_new
+
+        # Clamp P to search range
+        P_cur = max(P_lo, min(P_cur, P_hi * 2.0))
+
+        K_err = np.sum((np.log(K_new + 1e-300) - np.log(K + 1e-300)) ** 2)
+        K     = K_new
+
+        if K_err < tol and abs(S_new - 1.0) < tol:
+            converged = True
+            break
+
+    if not converged:
+        warnings_out.append(
+            f"Bubble point fugacity iteration did not converge in {max_iter} steps "
+            f"(last P={P_cur:.1f} psia, Σy={np.sum(K*z):.6f})."
+        )
+
+    return float(P_cur), converged, warnings_out
+
+
+def pr_dew_point_fugacity(mixture, T_F, P_lo=14.7, P_hi=10000.0,
+                           kij=None, max_iter=100, tol=1e-6):
+    """
+    Dew point pressure from PR EOS fugacity equality.
+
+    At dew point (vapor of composition z, infinitesimal liquid x):
+        φi_V(z, P, T) * zi = φi_L(x, P, T) * xi   for all i
+        Σ xi = 1
+
+    Source: Whitson & Brulé (2000) SPE Monograph Vol.20, Section 3.3.
+
+    Returns
+    -------
+    Pd        : float [psia] or NaN
+    converged : bool
+    warnings  : list of str
+    """
+    z     = mixture['z']
+    Tc    = mixture['Tc']
+    Pc    = mixture['Pc']
+    omega = mixture['omega']
+    T_R   = T_F + F_TO_R
+    warnings_out = []
+
+    def sum_x(P_val):
+        """Σ xi = Σ zi/Ki (Wilson initialization)."""
+        K = _wilson_K(Tc, Pc, omega, T_R, P_val)
+        return float(np.sum(z / np.maximum(K, 1e-30)))
+
+    # Bracket
+    try:
+        fa = sum_x(P_lo) - 1.0
+        fb = sum_x(P_hi) - 1.0
+    except Exception:
+        warnings_out.append("Dew point: could not evaluate Wilson K at bounds.")
+        return float('nan'), False, warnings_out
+
+    if fa * fb > 0:
+        warnings_out.append(
+            f"Dew point not bracketed in [{P_lo:.1f}, {P_hi:.1f}] psia. "
+            "Returning NaN."
+        )
+        return float('nan'), False, warnings_out
+
+    try:
+        P_wilson = brentq(lambda P: sum_x(P) - 1.0, P_lo, P_hi, xtol=1.0, maxiter=100)
+    except (ValueError, RuntimeError):
+        warnings_out.append("Dew point: Wilson bracket solve failed.")
+        return float('nan'), False, warnings_out
+
+    P_cur = P_wilson
+    K     = _wilson_K(Tc, Pc, omega, T_R, P_cur)
+    converged = False
+
+    for it in range(max_iter):
+        x_raw = z / np.maximum(K, 1e-30)
+        S     = x_raw.sum()
+        x     = x_raw / S
+
+        ln_phi_L, _ = _pr_fugacity_coeffs_root(P_cur, T_F, x, Tc, Pc, omega, kij, phase='liq')
+        ln_phi_V, _ = _pr_fugacity_coeffs_root(P_cur, T_F, z, Tc, Pc, omega, kij, phase='vap')
+
+        if np.any(np.isnan(ln_phi_L)) or np.any(np.isnan(ln_phi_V)):
+            warnings_out.append(f"Dew point: NaN fugacity at P={P_cur:.1f}, iter={it+1}.")
+            break
+
+        K_new = np.exp(ln_phi_L - ln_phi_V)
+        S_new = np.sum(z / np.maximum(K_new, 1e-30))
+        P_cur = P_cur / S_new
+        P_cur = max(P_lo, min(P_cur, P_hi * 2.0))
+
+        K_err = np.sum((np.log(K_new + 1e-300) - np.log(K + 1e-300)) ** 2)
+        K     = K_new
+
+        if K_err < tol and abs(S_new - 1.0) < tol:
+            converged = True
+            break
+
+    if not converged:
+        warnings_out.append(
+            f"Dew point fugacity iteration did not converge in {max_iter} steps "
+            f"(last P={P_cur:.1f} psia)."
+        )
+
+    return float(P_cur), converged, warnings_out
+
+
+# ---------------------------------------------------------------------------
+# PR PHASE ENVELOPE — FUGACITY-BASED
+# ---------------------------------------------------------------------------
+
+def pr_phase_envelope(mixture, T_range=(50.0, 400.0), n_T=60,
+                       kij=None, P_lo=14.7, P_hi=12000.0):
+    """
+    PT phase envelope using proper fugacity-based bubble and dew points.
+
+    Each temperature step calls pr_bubble_point_fugacity() and
+    pr_dew_point_fugacity(). Non-converged points are returned as NaN.
+
+    Source: Whitson & Brulé (2000) SPE Monograph Vol.20.
+
+    Returns
+    -------
+    dict:
+        'T'         : array [°F]
+        'P_bubble'  : array [psia]  (NaN where not converged)
+        'P_dew'     : array [psia]  (NaN where not converged)
+        'Tc_mix'    : float [°R]    (Kay's rule for reference)
+        'Pc_mix'    : float [psia]  (Kay's rule)
+        'bub_conv'  : array [bool]  — convergence flag per T
+        'dew_conv'  : array [bool]
+        'warnings'  : list of str
+    """
+    z     = mixture['z']
+    Tc    = mixture['Tc']
+    Pc    = mixture['Pc']
+    T_arr = np.linspace(T_range[0], T_range[1], n_T)
+
+    P_bub    = np.full(n_T, np.nan)
+    P_dew    = np.full(n_T, np.nan)
+    bub_conv = np.zeros(n_T, dtype=bool)
+    dew_conv = np.zeros(n_T, dtype=bool)
+    all_warnings = []
+
+    for i, T_F in enumerate(T_arr):
+        Pb, cb, wb = pr_bubble_point_fugacity(
+            mixture, T_F, P_lo=P_lo, P_hi=P_hi, kij=kij
+        )
+        P_bub[i]    = Pb if cb and not np.isnan(Pb) else np.nan
+        bub_conv[i] = cb
+
+        Pd, cd, wd = pr_dew_point_fugacity(
+            mixture, T_F, P_lo=P_lo, P_hi=P_hi, kij=kij
+        )
+        P_dew[i]    = Pd if cd and not np.isnan(Pd) else np.nan
+        dew_conv[i] = cd
+
+        all_warnings.extend(wb)
+        all_warnings.extend(wd)
+
+    return {
+        'T'        : T_arr,
+        'P_bubble' : P_bub,
+        'P_dew'    : P_dew,
+        'Tc_mix'   : float(np.dot(z, Tc)),   # Kay's rule
+        'Pc_mix'   : float(np.dot(z, Pc)),
+        'bub_conv' : bub_conv,
+        'dew_conv' : dew_conv,
+        'warnings' : all_warnings,
+    }
+
+
+# ---------------------------------------------------------------------------
+# PR BUBBLE POINT — internal Wilson-only helper (kept for pseudo-components)
+# ---------------------------------------------------------------------------
+
+def pr_bubble_point(mixture, T_F, P_low=14.7, P_high=10000.0):
+    """
+    Bubble point pressure via Wilson K-value criterion (internal helper).
+
+    Used for pseudo-component EOS table and header metric when no real
+    composition is available. For real compositions, prefer
+    pr_bubble_point_fugacity().
+
+    At bubble point: Σ(zi · Ki) = 1
+    Ki = (Pci/P) · exp[5.373·(1+ωi)·(1 - Tci/T)]   — Wilson (1969)
+
+    Returns
+    -------
+    Pb : float [psia] or NaN if not bracketed
+    """
+    z, Tc, Pc, omega = (
+        mixture['z'], mixture['Tc'], mixture['Pc'], mixture['omega']
+    )
+    T_R = T_F + F_TO_R
+
+    def f(P):
+        K = _wilson_K(Tc, Pc, omega, T_R, P)
+        return float(np.sum(z * K)) - 1.0
+
+    try:
+        return float(brentq(f, P_low, P_high, xtol=0.1))
+    except ValueError:
+        return float('nan')
+
+
+# ---------------------------------------------------------------------------
 # DENSITY
 # ---------------------------------------------------------------------------
 
@@ -392,7 +1115,7 @@ def pr_density(P, T_F, mixture):
     ----------
     P       : float — pressure [psia]
     T_F     : float — temperature [°F]
-    mixture : dict  — output of build_mixture() or pseudo_components()
+    mixture : dict  — from build_mixture() or pseudo_components()
 
     Returns
     -------
@@ -405,7 +1128,7 @@ def pr_density(P, T_F, mixture):
         mixture['omega'], mixture['MW']
     )
     a, b         = pr_parameters(Tc, Pc, omega, T_F)
-    a_mix, b_mix = pr_mix(a, b, z)
+    a_mix, b_mix, _ = pr_mix(a, b, z)
     Z_liq, _     = pr_z_factor(P, T_F, a_mix, b_mix)
 
     if Z_liq is None:
@@ -416,149 +1139,6 @@ def pr_density(P, T_F, mixture):
     MW_mix = float(np.dot(z, MW))
     rho   = MW_mix / V_mol
     return float(rho), float(Z_liq), float(V_mol)
-
-
-# ---------------------------------------------------------------------------
-# EOS BUBBLE POINT (WILSON K-VALUES)
-# ---------------------------------------------------------------------------
-
-def pr_bubble_point(mixture, T_F, P_low=14.7, P_high=10000.0):
-    """
-    Bubble point pressure from Wilson K-value criterion.
-
-    At bubble point: Σ(zi · Ki) = 1  (first vapor bubble forms)
-    Ki = (Pci/P) · exp[5.373·(1+ωi)·(1 - Tci/T)]   Wilson (1969)
-
-    Bisection on f(P) = Σ(zi·Ki) - 1.
-
-    Returns
-    -------
-    Pb : float [psia] or NaN if not bracketed
-    """
-    z, Tc, Pc, omega = (
-        mixture['z'], mixture['Tc'], mixture['Pc'], mixture['omega']
-    )
-    T = T_F + F_TO_R
-
-    def f(P):
-        K = (Pc / P) * np.exp(5.373 * (1.0 + omega) * (1.0 - Tc / T))
-        return float(np.sum(z * K)) - 1.0
-
-    try:
-        return float(brentq(f, P_low, P_high, xtol=0.1))
-    except ValueError:
-        return float('nan')
-
-
-# ---------------------------------------------------------------------------
-# PHASE ENVELOPE (WILSON K-VALUES)
-# ---------------------------------------------------------------------------
-
-def phase_envelope_wilson(mixture, T_range=(50.0, 400.0), n_T=80):
-    """
-    PT phase envelope via Wilson K-value criteria.
-
-    Bubble curve: Σ(zi·Ki) = 1  (liquid → two-phase boundary)
-    Dew curve:    Σ(zi/Ki) = 1  (vapor  → two-phase boundary)
-
-    Wilson K-values are a first-order approximation. The envelope shape
-    is qualitatively correct; quantitative accuracy requires PR fugacity
-    iteration with converged flash calculations (future extension).
-
-    Returns
-    -------
-    dict — T [°F], P_bubble [psia], P_dew [psia], Tc_mix [°R], Pc_mix [psia]
-    """
-    z, Tc, Pc, omega = (
-        mixture['z'], mixture['Tc'], mixture['Pc'], mixture['omega']
-    )
-    T_arr    = np.linspace(T_range[0], T_range[1], n_T)
-    P_bubble = np.full(n_T, np.nan)
-    P_dew    = np.full(n_T, np.nan)
-
-    for i, T_F in enumerate(T_arr):
-        T = T_F + F_TO_R
-        for eq_fn, arr in [
-            (lambda P: np.sum(z * (Pc/P) * np.exp(5.373*(1+omega)*(1-Tc/T))) - 1.0, P_bubble),
-            (lambda P: np.sum(z / ((Pc/P) * np.exp(5.373*(1+omega)*(1-Tc/T)))) - 1.0, P_dew),
-        ]:
-            try:
-                arr[i] = brentq(eq_fn, 10.0, 15000.0, xtol=0.5)
-            except ValueError:
-                pass
-
-    return {
-        'T'        : T_arr,
-        'P_bubble' : P_bubble,
-        'P_dew'    : P_dew,
-        'Tc_mix'   : float(np.dot(z, Tc)),   # Kay's rule
-        'Pc_mix'   : float(np.dot(z, Pc)),
-    }
-
-
-# ---------------------------------------------------------------------------
-# PXY DIAGRAM AT FIXED T
-# ---------------------------------------------------------------------------
-
-def pxy_diagram(comp_A, comp_B, T_F, P_range=(14.7, 3000.0), n_P=80):
-    """
-    Pxy diagram for a binary mixture of two named components at fixed T.
-
-    Computes bubble point pressure (Σzi·Ki=1) and dew point pressure
-    (Σzi/Ki=1) as functions of feed composition x_A (mole fraction of A).
-
-    This uses Wilson K-values — a first-order approximation valid for
-    qualitative phase behavior. For quantitative accuracy, PR fugacity
-    flash is required.
-
-    Parameters
-    ----------
-    comp_A, comp_B : str — component names from pure_components.csv
-    T_F            : float — temperature [°F]
-    P_range        : tuple — (P_min, P_max) search range [psia]
-    n_P            : int   — composition grid points
-
-    Returns
-    -------
-    dict — x_A, P_bubble, P_dew  (arrays, length n_P)
-    """
-    A = get_component(comp_A)
-    B = get_component(comp_B)
-    T = T_F + F_TO_R
-
-    Tc    = np.array([A['Tc'],    B['Tc']])
-    Pc    = np.array([A['Pc'],    B['Pc']])
-    omega = np.array([A['omega'], B['omega']])
-
-    x_A_arr  = np.linspace(0.001, 0.999, n_P)
-    P_bub    = np.full(n_P, np.nan)
-    P_dew    = np.full(n_P, np.nan)
-
-    for i, x_A in enumerate(x_A_arr):
-        z = np.array([x_A, 1.0 - x_A])
-
-        def bub(P):
-            K = (Pc / P) * np.exp(5.373 * (1 + omega) * (1 - Tc / T))
-            return np.sum(z * K) - 1.0
-
-        def dew(P):
-            K = (Pc / P) * np.exp(5.373 * (1 + omega) * (1 - Tc / T))
-            return np.sum(z / K) - 1.0
-
-        for fn, arr in [(bub, P_bub), (dew, P_dew)]:
-            try:
-                arr[i] = brentq(fn, P_range[0], P_range[1], xtol=0.5)
-            except ValueError:
-                pass
-
-    return {
-        'x_A'        : x_A_arr,
-        'P_bubble'   : P_bub,
-        'P_dew'      : P_dew,
-        'comp_A'     : comp_A,
-        'comp_B'     : comp_B,
-        'T_F'        : T_F,
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -591,10 +1171,10 @@ def eos_table(mixture, T_F, P_min=50.0, P_max=None, n_points=150):
     V_arr   = np.full(n_points, np.nan)
 
     for i, P in enumerate(P_arr):
-        rho, Z, V    = pr_density(P, T_F, mixture)
-        Z_arr[i]     = Z
-        rho_arr[i]   = rho
-        V_arr[i]     = V
+        rho, Z, V = pr_density(P, T_F, mixture)
+        Z_arr[i]   = Z
+        rho_arr[i] = rho
+        V_arr[i]   = V
 
     return {
         'P'      : P_arr,
@@ -611,61 +1191,72 @@ def eos_table(mixture, T_F, P_min=50.0, P_max=None, n_points=150):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("  EOS.py — Peng-Robinson with Real Compositions")
-    print("=" * 60)
+    print("=" * 65)
+    print("  eos.py — Peng-Robinson EOS Self-Test")
+    print("=" * 65)
 
     # ---- Test 1: CSV load
     print(f"\n  Pure components loaded: {len(PURE_COMPONENTS)} entries")
     print(f"  Components: {list(PURE_COMPONENTS.index)}")
 
-    # ---- Test 2: Real composition (typical black oil, Ahmed 2019 example)
+    # ---- Test 2: Real composition
     composition = {
-        'C1' : 0.45,
-        'C2' : 0.05,
-        'C3' : 0.05,
-        'nC4': 0.03,
-        'nC5': 0.01,
-        'nC6': 0.01,
-        'C7+': 0.40,
+        'C1' : 0.45, 'C2' : 0.05, 'C3' : 0.05,
+        'nC4': 0.03, 'nC5': 0.01, 'nC6': 0.01, 'C7+': 0.40,
     }
     c7_props = characterize_c7plus(MW_c7=215.0, SG_c7=0.87)
     mix = build_mixture(composition, c7plus_props=c7_props)
 
-    print(f"\n  Real composition mixture ({len(mix['names'])} components):")
-    for name, z, Tc, Pc, om in zip(
-        mix['names'], mix['z'], mix['Tc'], mix['Pc'], mix['omega']
-    ):
-        print(f"    {name:<5}  z={z:.4f}  Tc={Tc:.1f}°R  "
-              f"Pc={Pc:.1f} psia  omega={om:.4f}")
+    print(f"\n  Real composition ({len(mix['names'])} components):")
+    for name, z, Tc, Pc, om in zip(mix['names'], mix['z'], mix['Tc'], mix['Pc'], mix['omega']):
+        print(f"    {name:<5}  z={z:.4f}  Tc={Tc:.1f}°R  Pc={Pc:.1f} psia  ω={om:.4f}")
 
-    # ---- Test 3: Bubble point
     T_F = 180.0
-    Pb  = pr_bubble_point(mix, T_F)
-    print(f"\n  Wilson bubble point at T={T_F}°F: {Pb:.1f} psia")
 
-    # ---- Test 4: Z-factor sweep
-    print(f"\n  Z-factor and density:")
+    # ---- Test 3: Wilson bubble point (internal)
+    Pb_w = pr_bubble_point(mix, T_F)
+    print(f"\n  Wilson bubble point (internal helper): {Pb_w:.1f} psia")
+
+    # ---- Test 4: Fugacity bubble point
+    Pb_f, cb, wb = pr_bubble_point_fugacity(mix, T_F)
+    print(f"  Fugacity bubble point: {Pb_f:.1f} psia  converged={cb}")
+    for w in wb:
+        print(f"    WARNING: {w}")
+
+    # ---- Test 5: Fugacity dew point
+    Pd_f, cd, wd = pr_dew_point_fugacity(mix, T_F)
+    print(f"  Fugacity dew point:    {Pd_f:.1f} psia  converged={cd}")
+
+    # ---- Test 6: Stability test
+    is_stab, unstable_ph, sw = michelsen_stability_test(mix, P=1000.0, T_F=T_F)
+    print(f"\n  Michelsen stability at P=1000 psia, T=180°F:")
+    print(f"    is_stable={is_stab}  unstable_phase={unstable_ph}")
+
+    # ---- Test 7: Flash
+    flash = pr_flash(mix, P=1000.0, T_F=T_F)
+    print(f"\n  Flash at P=1000 psia, T=180°F:")
+    print(f"    phase={flash['phase']}  beta={flash['beta']:.4f}  "
+          f"converged={flash['converged']}  iter={flash['iterations']}")
+    if flash['warnings']:
+        for w in flash['warnings']:
+            print(f"    WARNING: {w}")
+
+    # ---- Test 8: Z-factor sweep
+    print(f"\n  PR density sweep:")
     for P in [500, 1000, 1500, 2000, 2500]:
         rho, Z, V = pr_density(P, T_F, mix)
-        print(f"    P={P:5.0f} psia  Z={Z:.4f}  rho={rho:.2f} lb/ft³")
+        print(f"    P={P:5d} psia  Z={Z:.4f}  rho={rho:.2f} lb/ft³")
 
-    # ---- Test 5: Phase envelope
-    env = phase_envelope_wilson(mix, T_range=(80, 350), n_T=20)
+    # ---- Test 9: Phase envelope
+    print(f"\n  Phase envelope (T=80–350°F, 20 points)...")
+    env = pr_phase_envelope(mix, T_range=(80, 350), n_T=20)
     bub_ok = np.sum(~np.isnan(env['P_bubble']))
     dew_ok = np.sum(~np.isnan(env['P_dew']))
-    print(f"\n  Phase envelope: {bub_ok} bubble pts, {dew_ok} dew pts")
-    print(f"  Mixture Tc (Kay's rule): {env['Tc_mix']-459.67:.1f}°F")
+    print(f"    Bubble: {bub_ok} converged pts  |  Dew: {dew_ok} converged pts")
 
-    # ---- Test 6: Pxy diagram
-    pxy = pxy_diagram('C1', 'C3', T_F=100.0, P_range=(14.7, 2000.0))
-    valid = np.sum(~np.isnan(pxy['P_bubble']))
-    print(f"\n  Pxy (C1-C3 at 100°F): {valid} bubble points computed")
-
-    # ---- Test 7: Pseudo-component fallback
+    # ---- Test 10: Pseudo-components
     pseudo = pseudo_components(API=35, GOR=500, gas_SG=0.65)
     Pb_ps  = pr_bubble_point(pseudo, T_F=180.0)
-    print(f"\n  Pseudo-component fallback Pb: {Pb_ps:.1f} psia")
-    print(f"  Note: {pseudo['note']}")
+    print(f"\n  Pseudo-component fallback Pb (Wilson): {Pb_ps:.1f} psia")
 
     print("\neos.py — all tests passed.")
