@@ -13,8 +13,9 @@ Tabs
   3. EOS           — PR EOS Z-factor, density, phase envelope
   4. 3D Surfaces   — interactive Plotly 3D (Bo, viscosity, Z, PVT)
   5. Phase         — PR fugacity phase envelope
-  6. Composition   — enter real mole fractions from a lab PVT report
-  7. About         — methodology, sources, references
+  6. Pxy Diagram   — Binary Pxy diagram via PR EOS fugacity
+  7. Composition   — enter real mole fractions from a lab PVT report
+  8. About         — methodology, sources, references
 """
 
 import streamlit as st
@@ -24,11 +25,13 @@ import matplotlib
 matplotlib.use('Agg')
 
 # Project modules
-from correlations import REGIONS, pvt_table, bubble_point, check_range
+from correlations import REGIONS, pvt_table, bubble_point, check_range, solution_gor
+from correlations import formation_volume_factor, viscosity, oil_compressibility
 from eos import (
     pseudo_components, build_mixture, characterize_c7plus,
     eos_table, pr_bubble_point, pr_flash,
-    michelsen_stability_test, PURE_COMPONENTS
+    michelsen_stability_test, PURE_COMPONENTS,
+    pxy_diagram_fugacity,
 )
 from gas_pvt import gas_pvt_table
 import plotting as P
@@ -39,24 +42,50 @@ import plotting as P
 
 st.set_page_config(
     page_title="PVT Analyzer",
-    page_icon="🛢️",
+    page_icon=None,
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 st.markdown("""
 <style>
+    /* ── Global font ── */
+    html, body, [class*="css"], .stApp, .block-container,
+    .stMarkdown, .stText, .stMetric, .stDataFrame,
+    .stSelectbox, .stSlider, .stRadio, .stCheckbox,
+    .stNumberInput, .stExpander, .stDownloadButton,
+    h1, h2, h3, h4, h5, h6, p, div, span, label, button {
+        font-family: 'Times New Roman', Times, serif !important;
+        line-height: 2.0 !important;
+    }
+
     .block-container { padding-top: 1.5rem; }
-    .stTabs [data-baseweb="tab"] { font-size: 0.9rem; }
+
+    /* ── Tab labels ── */
+    .stTabs [data-baseweb="tab"] {
+        font-size: 1.15rem !important;
+        font-weight: 700 !important;
+        padding: 0.75rem 1.8rem !important;
+        font-family: 'Times New Roman', Times, serif !important;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+
+    /* ── Assumption / source boxes ── */
     .assumption-box {
         background: #FFF8E1; border-left: 4px solid #FFC107;
         padding: 0.6rem 1rem; border-radius: 4px; margin: 0.5rem 0;
         font-size: 0.85rem; color: #5D4037;
+        font-family: 'Times New Roman', Times, serif !important;
+        line-height: 1.8 !important;
     }
     .source-box {
         background: #E8F5E9; border-left: 4px solid #4CAF50;
         padding: 0.4rem 0.8rem; border-radius: 4px;
         font-size: 0.78rem; color: #1B5E20;
+        font-family: 'Times New Roman', Times, serif !important;
+        line-height: 1.8 !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -67,7 +96,7 @@ st.markdown("""
 # ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.header("🛢️ Fluid Properties")
+    st.header("Fluid Properties")
 
     API    = st.slider("API Gravity [°API]", 15, 60, 35, 1,
                        help="Stock-tank oil API gravity.")
@@ -92,7 +121,7 @@ with st.sidebar:
         st.markdown(
             "V&B correlations were developed at a reference separator pressure "
             "of 100 psia. If your gas SG was measured at a different separator "
-            "pressure, enter those conditions here to correct γ_g before "
+            "pressure, enter those conditions here to correct gamma_g before "
             "applying the correlation."
         )
     use_sep_corr = st.checkbox("Apply separator correction (global region only)")
@@ -151,6 +180,12 @@ def _compute_pvt_grid_cached(API, GOR, gas_SG, T_range, P_range, n_T, n_P):
     return P._compute_pvt_grid(API, GOR, gas_SG, T_range, P_range, n_T, n_P)
 
 
+@st.cache_data(show_spinner=False)
+def compute_pxy(comp_A, comp_B, T_F, P_lo, P_hi, n_x):
+    return pxy_diagram_fugacity(comp_A, comp_B, T_F,
+                                 P_range=(P_lo, P_hi), n_x=n_x)
+
+
 # ---------------------------------------------------------------------------
 # COMPUTE SHARED STATE (runs on every slider change — no button guard)
 # ---------------------------------------------------------------------------
@@ -175,7 +210,7 @@ if range_warns:
 # HEADER METRICS
 # ---------------------------------------------------------------------------
 
-st.title("🛢️ PVT Analyzer")
+st.title("PVT Analyzer")
 st.caption(
     "Empirical correlations (Standing, Al-Marhoun, Glaso, Vasquez & Beggs, "
     "Petrosky & Farshad) + Peng-Robinson EOS with real or pseudo-compositions. "
@@ -183,9 +218,9 @@ st.caption(
 )
 
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("API Gravity",    f"{API}°API")
+c1.metric("API Gravity",    f"{API} °API")
 c2.metric("Surface GOR",    f"{GOR} scf/STB")
-c3.metric("Temperature",    f"{T}°F")
+c3.metric("Temperature",    f"{T} °F")
 c4.metric("Pb (Corr.)",     f"{Pb_corr:.0f} psia")
 c5.metric("Pb (EOS Wilson)",f"{Pb_eos:.0f} psia" if not np.isnan(Pb_eos) else "—")
 
@@ -197,13 +232,14 @@ st.divider()
 # ---------------------------------------------------------------------------
 
 tabs = st.tabs([
-    "📈 Correlations",
-    "💨 Gas PVT",
-    "⚗️ EOS",
-    "🌐 3D Surfaces",
-    "🔀 Phase",
-    "🧪 Composition",
-    "📖 About",
+    "Correlations",
+    "Gas PVT",
+    "EOS",
+    "3D Surfaces",
+    "Phase",
+    "Pxy Diagram",
+    "Composition",
+    "About",
 ])
 
 
@@ -225,67 +261,105 @@ with tabs[0]:
         'saturated. All other regions use Beggs & Robinson (1975). '
         'Undersaturated correction: Vasquez & Beggs (1980) for all regions. '
         '<b>Compressibility:</b> Vasquez & Beggs (1980) SPE-6719 Eq. 2-47 '
-        '(co = (5Rs + 17.2T − 1180γg + 12.61API − 1433) / (10⁵ P)); '
+        '(co = (5Rs + 17.2T - 1180γg + 12.61API - 1433) / (10^5 P)); '
         'defined only above Pb. '
-        'Petrosky & Farshad results are flagged if Pb ≤ 14.7 psia '
+        'Petrosky & Farshad results are flagged if Pb <= 14.7 psia '
         '(outside development range).'
         '</div>',
         unsafe_allow_html=True,
     )
 
-    col_left, col_right = st.columns([2, 1])
-
-    with col_left:
-        fig_pvt, _ = P.plot_pvt_curves(API, GOR, T, gas_SG,
-                                        region=region, **sep_kw)
-        st.pyplot(fig_pvt, use_container_width=True)
-
-    with col_right:
-        st.markdown("**Bubble Point Summary**")
-        pb_data = []
-        for r in REGIONS:
-            pb   = bubble_point(API, GOR, T, gas_SG, region=r)
-            flag = " ⚠️ out-of-range" if pb <= 14.8 else ""
-            pb_data.append({
-                'Region': REGIONS[r].split('—')[0].strip(),
-                'Pb [psia]': f"{pb:.0f}{flag}",
-            })
-        st.dataframe(pd.DataFrame(pb_data), use_container_width=True,
-                     hide_index=True)
-
-        st.markdown("**Selected region Pb**")
-        st.metric(REGIONS[region].split('—')[0].strip(), f"{Pb_corr:.1f} psia")
+    # ── Individual full-width Plotly PVT curves ──
+    fig_rs, fig_bo, fig_visc = P.plot_pvt_curves_plotly(
+        API, GOR, T, gas_SG, region=region, **sep_kw
+    )
+    st.plotly_chart(fig_rs,   use_container_width=True)
+    st.plotly_chart(fig_bo,   use_container_width=True)
+    st.plotly_chart(fig_visc, use_container_width=True)
 
     st.divider()
+
+    # ── Bubble Point Summary table ──
+    st.markdown("**Bubble Point Summary**")
+    pb_data = []
+    for r in REGIONS:
+        pb   = bubble_point(API, GOR, T, gas_SG, region=r)
+        flag = " (out-of-range)" if pb <= 14.8 else ""
+        pb_data.append({
+            'Region': REGIONS[r].split('—')[0].strip(),
+            'Pb [psia]': f"{pb:.0f}{flag}",
+        })
+    st.dataframe(pd.DataFrame(pb_data), use_container_width=True, hide_index=True)
+
+    st.markdown("**Selected region Pb**")
+    st.metric(REGIONS[region].split('—')[0].strip(), f"{Pb_corr:.1f} psia")
+
+    st.divider()
+
+    # ── Regional Comparison (bar chart only) ──
     st.subheader("Regional Comparison")
     fig_reg, _ = P.plot_regional_comparison(API, GOR, T, gas_SG)
     st.pyplot(fig_reg, use_container_width=True)
 
     st.divider()
+
+    # ── PVT Data Table (fixed pressure array) ──
     st.subheader("PVT Data Table")
 
-    # Build table including co
-    co_vals = tbl['co']
+    P_table = np.arange(50, 4001, 50)   # 50 to 4000 psia in 50 psia steps (79 rows)
+    Pb_val  = tbl['Pb']
+
+    # Compute properties at each fixed pressure
+    Rs_tbl  = np.array([float(solution_gor(np.array([p]), API, T, gas_SG, Pb_val, GOR, region=region)[0])
+                         for p in P_table])
+    Bo_tbl  = np.array([float(formation_volume_factor(np.array([p]), API, T, gas_SG, Pb_val, GOR, region=region)[0])
+                         for p in P_table])
+    mu_tbl  = np.array([float(viscosity(np.array([p]), API, T, gas_SG, Pb_val, GOR, region=region)[0])
+                         for p in P_table])
+    co_tbl  = np.array([float(oil_compressibility(np.array([p]), API, T, gas_SG, Pb_val, GOR)[0])
+                         for p in P_table])
+
     df_tbl = pd.DataFrame({
-        'P [psia]'        : tbl['P'].round(1),
-        'Rs [scf/STB]'    : tbl['Rs'].round(2),
-        'Bo [RB/STB]'     : tbl['Bo'].round(4),
-        'μo [cp]'         : tbl['mu_o'].round(4),
-        'co [psi⁻¹]'      : co_vals,   # NaN below Pb is acceptable
+        'P [psia]'                              : P_table,
+        'T [°F]'                              : T,
+        'Rs [scf/STB] — Solution GOR'           : np.round(Rs_tbl, 2),
+        'Bo [RB/STB] — Oil FVF'                 : np.round(Bo_tbl, 4),
+        'μo [cp] — Oil viscosity'               : np.round(mu_tbl, 4),
+        'co [psi⁻¹] — Compressibility'          : co_tbl,
     })
+
     # Format co column — NaN shown as "< Pb"
     df_display = df_tbl.copy()
-    df_display['co [psi⁻¹]'] = df_tbl['co [psi⁻¹]'].apply(
+    df_display['co [psi⁻¹] — Compressibility'] = df_tbl['co [psi⁻¹] — Compressibility'].apply(
         lambda v: f"{v:.3e}" if not np.isnan(v) else "< Pb"
     )
-    st.dataframe(df_display, use_container_width=True, height=300)
 
+    st.dataframe(df_display, use_container_width=True, height=350, hide_index=True)
+
+    with st.expander("What do these columns mean?"):
+        st.markdown(
+            "- **P [psia]**: Reservoir pressure at which properties are evaluated.\n"
+            "- **T [°F]**: Reservoir temperature, constant throughout — it is a parameter, "
+            "not a variable in this pressure sweep.\n"
+            "- **Rs [scf/STB]**: Cubic feet of gas dissolved per stock-tank barrel of oil "
+            "at this pressure and reservoir T. Equal to the surface GOR when P >= Pb "
+            "(all gas remains dissolved).\n"
+            "- **Bo [RB/STB]**: Volume of oil plus dissolved gas at reservoir conditions "
+            "per barrel at stock-tank conditions; always >= 1.0.\n"
+            "- **μo [cp]**: Dynamic viscosity of reservoir oil in centipoise; decreases as "
+            "dissolved gas increases below Pb.\n"
+            "- **co [psi⁻¹]**: Isothermal compressibility of undersaturated oil above the "
+            "bubble point. Shown as '< Pb' when pressure is below the bubble point "
+            f"(Pb = {Pb_val:.0f} psia) where this correlation is undefined."
+        )
+
+    # Download button
     csv_tbl = df_tbl.copy()
-    csv_tbl['co [psi⁻¹]'] = csv_tbl['co [psi⁻¹]'].fillna('')
+    csv_tbl['co [psi⁻¹] — Compressibility'] = csv_tbl['co [psi⁻¹] — Compressibility'].fillna('')
     st.download_button(
-        "⬇️ Download PVT table as CSV",
+        "Download PVT table as CSV",
         csv_tbl.to_csv(index=False),
-        file_name=f"pvt_table_API{API}_GOR{GOR}.csv",
+        file_name=f"pvt_table_API{API}_GOR{GOR}_T{T}F.csv",
         mime="text/csv",
     )
 
@@ -341,10 +415,10 @@ with tabs[1]:
             key='g_zmethod',
         )
         if z_method == "dpr":
-            st.info("DPR validity: 1.05 ≤ Tpr ≤ 3.0, 0 < Ppr ≤ 3.0. "
+            st.info("DPR validity: 1.05 <= Tpr <= 3.0, 0 < Ppr <= 3.0. "
                     "Values outside this range are extrapolations.")
 
-    with st.spinner("Computing gas PVT…"):
+    with st.spinner("Computing gas PVT..."):
         gas_tbl = compute_gas_pvt(gas_SG_g, T_g, y_CO2, y_H2S, fluid_type, z_method)
 
     # Show warnings
@@ -406,7 +480,7 @@ with tabs[1]:
         'cg_psi_inv'    : gas_tbl['cg'][valid_mask],
     })
     st.download_button(
-        "⬇️ Download gas PVT table as CSV",
+        "Download gas PVT table as CSV",
         csv_gas.to_csv(index=False),
         file_name=f"gas_pvt_SG{gas_SG_g:.3f}_T{T_g}F.csv",
         mime="text/csv",
@@ -437,7 +511,7 @@ with tabs[2]:
 
     fig_eos, _ = P.plot_eos_curves(
         pseudo, T_F=T,
-        label=f'API={API}°, GOR={GOR} scf/STB (pseudo-components)'
+        label=f'API={API} deg, GOR={GOR} scf/STB (pseudo-components)'
     )
     st.pyplot(fig_eos, use_container_width=True)
 
@@ -489,7 +563,7 @@ with tabs[3]:
     T_range_3d = (float(T_min_3d), float(T_max_3d))
     P_range_3d = (float(P_min_3d), float(P_max_3d))
 
-    with st.spinner("Computing surface…"):
+    with st.spinner("Computing surface..."):
         if surface_choice.startswith("Bo"):
             P_arr_g, T_arr_g, grid_g = _compute_bo_grid_cached(
                 API, GOR, gas_SG, T_range_3d, P_range_3d, region, 30, 40
@@ -516,7 +590,7 @@ with tabs[3]:
             )
             fig_3d = P.plot_3d_surface(
                 P_arr_g, T_arr_g, grid_g,
-                title=f'Z-Factor(P,T) — PR EOS — API={API}°',
+                title=f'Z-Factor(P,T) — PR EOS — API={API} deg',
                 z_label='Z [-]', colorscale='Plasma',
             )
         else:
@@ -525,7 +599,7 @@ with tabs[3]:
             )
             fig_3d = P.plot_3d_surface(
                 P_arr_g, T_arr_g, grid_g,
-                title=f'P-V-T Surface (Molar Volume) — API={API}°',
+                title=f'P-V-T Surface (Molar Volume) — API={API} deg',
                 z_label='V [ft³/lbmol]', colorscale='Turbo',
             )
 
@@ -555,7 +629,7 @@ with tabs[4]:
         '(Peng & Robinson 1976 Eq. 18). Wilson K-values (Wilson 1969) used '
         'only as internal initialization; final results are fugacity-converged. '
         'Non-converged points are shown as gaps in the envelope. '
-        'Source: Whitson & Brulé (2000) SPE Monograph Vol.20, Section 3.3.'
+        'Source: Whitson & Brule (2000) SPE Monograph Vol.20, Section 3.3.'
         '</div>',
         unsafe_allow_html=True,
     )
@@ -563,11 +637,11 @@ with tabs[4]:
     T_env_min = st.slider("T range min [°F]", 50, 150, 80,  key='envmin')
     T_env_max = st.slider("T range max [°F]", 200, 500, 380, key='envmax')
 
-    with st.spinner("Building phase envelope (fugacity iterations)…"):
+    with st.spinner("Building phase envelope (fugacity iterations)..."):
         fig_env, _ = P.plot_phase_envelope(
             pseudo,
             T_range=(float(T_env_min), float(T_env_max)),
-            label=f'API={API}°, GOR={GOR} (pseudo-components)'
+            label=f'API={API} deg, GOR={GOR} (pseudo-components)'
         )
     st.pyplot(fig_env, use_container_width=True)
 
@@ -575,7 +649,7 @@ with tabs[4]:
         '<div class="assumption-box">'
         '<b>Limitations:</b> Two pseudo-components (gas + C7+) yield extreme '
         'Tc/Pc asymmetry. The phase envelope for real fluids should use '
-        '6–12 components with calibrated binary interaction parameters (kij). '
+        '6-12 components with calibrated binary interaction parameters (kij). '
         'For higher accuracy, provide real composition in the Composition tab.'
         '</div>',
         unsafe_allow_html=True,
@@ -583,10 +657,91 @@ with tabs[4]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 6 — COMPOSITION
+# TAB 6 — Pxy DIAGRAM
 # ════════════════════════════════════════════════════════════════════════════
 
 with tabs[5]:
+    st.subheader("Binary Pxy Diagram")
+
+    st.markdown(
+        '<div class="source-box">'
+        'PR EOS fugacity equality (Peng-Robinson 1976). Bubble and dew curves '
+        'computed by solving fugacity equality at each feed composition.'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    available_components = [c for c in PURE_COMPONENTS.index
+                             if c not in ('C7+', 'C7PLUS')]
+
+    pxy_col1, pxy_col2 = st.columns(2)
+    with pxy_col1:
+        comp_A_sel = st.selectbox(
+            "Component A",
+            available_components,
+            index=available_components.index('C1') if 'C1' in available_components else 0,
+            key='pxy_compA',
+        )
+    with pxy_col2:
+        comp_B_sel = st.selectbox(
+            "Component B",
+            [c for c in available_components if c != comp_A_sel],
+            index=0,
+            key='pxy_compB',
+        )
+
+    T_pxy = st.slider(
+        "Temperature [°F]", -200, 400, 50, 5, key='pxy_T',
+        help="Temperature for the Pxy diagram."
+    )
+
+    pxy_p_col1, pxy_p_col2 = st.columns(2)
+    with pxy_p_col1:
+        P_pxy_lo = st.number_input("P range low [psia]",  1.0, 500.0,  14.7, 1.0, key='pxy_plo')
+    with pxy_p_col2:
+        P_pxy_hi = st.number_input("P range high [psia]", 100.0, 15000.0, 5000.0, 50.0, key='pxy_phi')
+
+    n_pxy = st.slider("Number of composition steps", 20, 100, 50, 5, key='pxy_n')
+
+    if comp_A_sel == comp_B_sel:
+        st.warning("Component A and Component B must be different.")
+    elif P_pxy_lo >= P_pxy_hi:
+        st.warning("P range low must be less than P range high.")
+    else:
+        with st.spinner(f"Computing Pxy diagram for {comp_A_sel}/{comp_B_sel} at T={T_pxy} °F..."):
+            pxy_result = compute_pxy(
+                comp_A_sel, comp_B_sel, float(T_pxy),
+                float(P_pxy_lo), float(P_pxy_hi), int(n_pxy)
+            )
+
+        fig_pxy = P.plot_pxy_plotly(pxy_result)
+        st.plotly_chart(fig_pxy, use_container_width=True)
+
+        bub_conv = int(np.sum(~np.isnan(pxy_result['P_bubble'])))
+        dew_conv = int(np.sum(~np.isnan(pxy_result['P_dew'])))
+        st.caption(
+            f"Bubble curve: {bub_conv}/{n_pxy} points converged.  "
+            f"Dew curve: {dew_conv}/{n_pxy} points converged.  "
+            "Non-converged points appear as gaps."
+        )
+
+        st.markdown(
+            '<div class="assumption-box">'
+            'Binary interaction parameters kij = 0 (ideal mixing). '
+            'This is acceptable for hydrocarbon-hydrocarbon pairs but introduces '
+            'error for CO2/H2S-containing systems. '
+            'Wilson K-values are used only as initial guess for the fugacity iteration '
+            '— final bubble/dew pressures are fugacity-converged.'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# TAB 7 — COMPOSITION
+# ════════════════════════════════════════════════════════════════════════════
+
+with tabs[6]:
     st.subheader("Real Fluid Composition Input")
     st.markdown(
         "Enter mole fractions from a lab PVT compositional report. "
@@ -671,7 +826,7 @@ with tabs[5]:
         mix_df = pd.DataFrame({
             'Component': mixture['names'],
             'z [-]'    : np.round(mixture['z'], 5),
-            'Tc [°R]'  : np.round(mixture['Tc'], 1),
+            'Tc [°R]': np.round(mixture['Tc'], 1),
             'Pc [psia]': np.round(mixture['Pc'], 1),
             'ω [-]'    : np.round(mixture['omega'], 4),
             'MW'       : np.round(mixture['MW'], 3),
@@ -693,7 +848,7 @@ with tabs[5]:
         st.markdown("**Flash Calculation**")
         P_flash = st.slider("Flash pressure [psia]", 100, 8000, 1500, 50,
                             key='p_flash_comp')
-        with st.spinner("Running flash…"):
+        with st.spinner("Running flash..."):
             flash_res = pr_flash(mixture, P_flash, T)
 
         for w in flash_res['warnings']:
@@ -706,7 +861,7 @@ with tabs[5]:
         st.divider()
         T_env_c_min = st.slider("Phase envelope T min [°F]", 50, 150, 80,  key='envmin_comp')
         T_env_c_max = st.slider("Phase envelope T max [°F]", 200, 500, 380, key='envmax_comp')
-        with st.spinner("Building phase envelope…"):
+        with st.spinner("Building phase envelope..."):
             fig_env_real, _ = P.plot_phase_envelope(
                 mixture,
                 T_range=(float(T_env_c_min), float(T_env_c_max)),
@@ -720,7 +875,7 @@ with tabs[5]:
 
         st.markdown(
             '<div class="assumption-box">'
-            f'C7+ Tc={c7_props["Tc"]:.1f}°R, Pc={c7_props["Pc"]:.1f} psia '
+            f'C7+ Tc={c7_props["Tc"]:.1f} °R, Pc={c7_props["Pc"]:.1f} psia '
             f'from Katz-Firoozabadi (1978) table at MW={MW_c7:.0f}. '
             f'Pc adjusted so PR b = 2.0 ft³/lbmol. '
             f'Source: {c7_props["source"]}'
@@ -730,10 +885,10 @@ with tabs[5]:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 7 — ABOUT
+# TAB 8 — ABOUT
 # ════════════════════════════════════════════════════════════════════════════
 
-with tabs[6]:
+with tabs[7]:
     st.subheader("Methodology and References")
 
     st.markdown("""
@@ -766,7 +921,7 @@ Vasquez & Beggs (1980) SPE-6719; Ahmed (2019) Eq. 2-47:
 
     co = (5·Rs + 17.2·T − 1180·γg + 12.61·API − 1433) / (10⁵ · P)   [psi⁻¹]
 
-Defined only above bubble point (P ≥ Pb). Below Pb, co is shown as "< Pb".
+Defined only above bubble point (P >= Pb). Below Pb, co is shown as "< Pb".
 
 ---
 
@@ -781,11 +936,11 @@ Defined only above bubble point (P ≥ Pb). Below Pb, co is shown as "< Pb".
 
 #### Z-Factor Methods
 - **Hall-Yarborough (1974)** SPE-3350-PA — primary method
-  - Newton-Raphson on Starling-Carnahan EOS; valid Tpr ≥ 1.05
+  - Newton-Raphson on Starling-Carnahan EOS; valid Tpr >= 1.05
   - Convergence: |Δy/y| < 1×10⁻¹⁰; max 200 iterations
   - Returns NaN with warning if Tpr < 1.05 (correlation undefined)
 - **DPR (1974)** — Dranchuk, Purvis & Robinson; BWR-type, 8 constants
-  - Stated validity: 1.05 ≤ Tpr ≤ 3.0, 0 < Ppr ≤ 3.0
+  - Stated validity: 1.05 <= Tpr <= 3.0, 0 < Ppr <= 3.0
   - Outside range: result flagged as extrapolation
 
 #### Gas Viscosity
@@ -823,7 +978,13 @@ Two trial phases (vapor-like and liquid-like Wilson K-value initializations).
 
 #### Bubble/Dew Points
 Proper fugacity equality iteration — not Wilson K-values.
-Algorithm: Whitson & Brulé (2000) SPE Monograph Vol.20, Section 3.3.
+Algorithm: Whitson & Brule (2000) SPE Monograph Vol.20, Section 3.3.
+
+#### Pxy Diagram
+Binary Pxy diagram via PR EOS fugacity iteration at fixed T.
+Bubble and dew curves computed by solving fugacity equality at each feed composition.
+Source: Peng & Robinson (1976); Michelsen & Mollerup (2007) Thermodynamic
+Models: Fundamentals & Computational Aspects, Ch. 5.
 
 ---
 
@@ -857,14 +1018,15 @@ Critical pressure adjusted so PR b = 2.0 ft³/lbmol (Ahmed 2019, Ch. 2).
 9. Katz, D.L. & Firoozabadi, A. (1978). Predicting Phase Behavior of Condensate/Crude-Oil Systems. *JPT* 30(11):1649–1655.
 10. Lee, A.L., Gonzalez, M.H. & Eakin, B.E. (1966). The Viscosity of Natural Gas. *JPT* Aug. 1966:997–1000. SPE-1340-PA.
 11. Michelsen, M.L. (1982). The Isothermal Flash Problem. Part I. Stability. *Fluid Phase Equilibria* 9(1):1–19.
-12. Peng, D.Y. & Robinson, D.B. (1976). A New Two-Constant Equation of State. *Ind. Eng. Chem. Fundam.* 15(1):59–64.
-13. Petrosky, G.E. & Farshad, F.F. (1993). PVT Correlations for Gulf of Mexico Crude Oils. SPE-26644.
-14. Rachford, H.H. & Rice, J.D. (1952). Procedure for Use of Electronic Digital Computers in Calculating Flash Vaporization. *Trans. AIME* 195:327–328.
-15. Standing, M.B. (1947). A Pressure-Volume-Temperature Correlation for Mixtures of California Oils and Gases. *Drill. & Prod. Prac.*, API.
-16. Standing, M.B. (1977). *Volumetric and Phase Behavior of Oil Field Hydrocarbon Systems*, 9th ed. SPE.
-17. Sutton, R.P. (1985). Compressibility Factors for High-Molecular-Weight Reservoir Gases. SPE-14265.
-18. Vasquez, M. & Beggs, H.D. (1980). Correlations for Fluid Physical Property Prediction. *JPT* 32(6):968–970. SPE-6719.
-19. Whitson, C.H. & Brulé, M.R. (2000). *Phase Behavior of Petroleum Reservoir Fluids*. SPE Monograph Vol. 20.
-20. Wichert, E. & Aziz, K. (1972). Calculate Z's for Sour Gases. *Hydrocarbon Processing*, May 1972, pp. 119–122.
-21. Wilson, G.M. (1969). A Modified Redlich-Kwong EOS. AIChE 65th National Meeting, Paper 15C.
+12. Michelsen, M.L. & Mollerup, J.M. (2007). *Thermodynamic Models: Fundamentals & Computational Aspects*, 2nd ed.
+13. Peng, D.Y. & Robinson, D.B. (1976). A New Two-Constant Equation of State. *Ind. Eng. Chem. Fundam.* 15(1):59–64.
+14. Petrosky, G.E. & Farshad, F.F. (1993). PVT Correlations for Gulf of Mexico Crude Oils. SPE-26644.
+15. Rachford, H.H. & Rice, J.D. (1952). Procedure for Use of Electronic Digital Computers in Calculating Flash Vaporization. *Trans. AIME* 195:327–328.
+16. Standing, M.B. (1947). A Pressure-Volume-Temperature Correlation for Mixtures of California Oils and Gases. *Drill. & Prod. Prac.*, API.
+17. Standing, M.B. (1977). *Volumetric and Phase Behavior of Oil Field Hydrocarbon Systems*, 9th ed. SPE.
+18. Sutton, R.P. (1985). Compressibility Factors for High-Molecular-Weight Reservoir Gases. SPE-14265.
+19. Vasquez, M. & Beggs, H.D. (1980). Correlations for Fluid Physical Property Prediction. *JPT* 32(6):968–970. SPE-6719.
+20. Whitson, C.H. & Brule, M.R. (2000). *Phase Behavior of Petroleum Reservoir Fluids*. SPE Monograph Vol. 20.
+21. Wichert, E. & Aziz, K. (1972). Calculate Z's for Sour Gases. *Hydrocarbon Processing*, May 1972, pp. 119–122.
+22. Wilson, G.M. (1969). A Modified Redlich-Kwong EOS. AIChE 65th National Meeting, Paper 15C.
 """)

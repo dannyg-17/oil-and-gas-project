@@ -1187,6 +1187,76 @@ def eos_table(mixture, T_F, P_min=50.0, P_max=None, n_points=150):
 
 
 # ---------------------------------------------------------------------------
+# BINARY Pxy DIAGRAM — PR EOS FUGACITY
+# ---------------------------------------------------------------------------
+
+def pxy_diagram_fugacity(comp_A, comp_B, T_F, P_range=(14.7, 5000.0), n_x=60):
+    """
+    Binary Pxy diagram via PR EOS fugacity equality.
+
+    For each feed composition z_A from 0 to 1, finds bubble point pressure
+    (Sigma Ki*zi = 1, x=z) and dew point pressure (Sigma zi/Ki = 1, y=z) using
+    full PR fugacity iteration.
+
+    Source: Peng & Robinson (1976); Michelsen & Mollerup (2007) Thermodynamic
+            Models: Fundamentals & Computational Aspects, Ch. 5.
+
+    Parameters
+    ----------
+    comp_A  : str   — component name A (from pure_components.csv)
+    comp_B  : str   — component name B
+    T_F     : float — temperature [degF]
+    P_range : tuple — (P_low, P_high) [psia] search range
+    n_x     : int   — number of feed composition steps
+
+    Returns
+    -------
+    dict with keys:
+        'x_A'      : array — feed mole fraction of A (0 to 1)
+        'P_bubble' : array — bubble point pressures [psia]  (NaN if not converged)
+        'P_dew'    : array — dew point pressures [psia]     (NaN if not converged)
+        'comp_A'   : str
+        'comp_B'   : str
+        'T_F'      : float
+    """
+    x_A_arr = np.linspace(0.001, 0.999, n_x)
+    P_bub   = np.full(n_x, np.nan)
+    P_dew   = np.full(n_x, np.nan)
+
+    for i, x_A in enumerate(x_A_arr):
+        comp_dict = {comp_A: float(x_A), comp_B: float(1.0 - x_A)}
+        # Bubble point
+        try:
+            mix = build_mixture(comp_dict)
+            Pb, cb, _ = pr_bubble_point_fugacity(
+                mix, T_F, P_lo=P_range[0], P_hi=P_range[1]
+            )
+            if cb and not np.isnan(Pb):
+                P_bub[i] = Pb
+        except Exception:
+            pass
+        # Dew point
+        try:
+            mix = build_mixture(comp_dict)
+            Pd, cd, _ = pr_dew_point_fugacity(
+                mix, T_F, P_lo=P_range[0], P_hi=P_range[1]
+            )
+            if cd and not np.isnan(Pd):
+                P_dew[i] = Pd
+        except Exception:
+            pass
+
+    return {
+        'x_A'     : x_A_arr,
+        'P_bubble': P_bub,
+        'P_dew'   : P_dew,
+        'comp_A'  : comp_A,
+        'comp_B'  : comp_B,
+        'T_F'     : T_F,
+    }
+
+
+# ---------------------------------------------------------------------------
 # SELF-TEST
 # ---------------------------------------------------------------------------
 

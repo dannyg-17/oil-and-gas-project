@@ -99,47 +99,71 @@ def _add_pb_line(ax, Pb, color='red', label=True):
 def plot_pvt_curves(API, GOR, T, gas_SG, region='global',
                     T_sp=60.0, P_sp=114.7):
     """
-    Four-panel plot: Rs, Bo, viscosity, and co vs pressure.
+    DEPRECATED — kept for backward compatibility; returns (None, None).
+    Use plot_pvt_curves_plotly() instead.
+    """
+    return None, None
+
+
+def plot_pvt_curves_plotly(API, GOR, T, gas_SG, region='global',
+                            T_sp=60.0, P_sp=114.7):
+    """
+    Return THREE individual full-width Plotly figures for Rs, Bo, and viscosity
+    vs pressure.  Each figure has a vertical dashed line at Pb and hover showing
+    exact pressure and property value.
+
+    Parameters
+    ----------
+    API, GOR, T, gas_SG : floats — fluid properties
+    region              : str    — correlation region key
+    T_sp, P_sp          : floats — separator conditions for V&B correction
 
     Returns
     -------
-    fig, axes : matplotlib Figure and axes array [4]
+    fig_rs, fig_bo, fig_visc : three plotly Figure objects
     """
-    _apply_style()
-    tbl = pvt_table(API, GOR, T, gas_SG, region=region,
-                    T_sp=T_sp, P_sp=P_sp)
-    P   = tbl['P']
-    Pb  = tbl['Pb']
+    tbl  = pvt_table(API, GOR, T, gas_SG, region=region, T_sp=T_sp, P_sp=P_sp)
+    Pvec = tbl['P']
+    Pb   = tbl['Pb']
     region_label = REGIONS[region].split('—')[0].strip()
 
-    fig, axes = plt.subplots(1, 4, figsize=(18, 4.5))
-    fig.suptitle(
-        f'Oil PVT Properties — {region_label}\n'
-        f'API={API}°, GOR={GOR} scf/STB, T={T}°F, $\\gamma_g$={gas_SG}',
-        fontsize=11, y=1.02
-    )
+    def _make_fig(y_vals, y_label, color, title):
+        valid = ~np.isnan(y_vals)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=Pvec[valid], y=y_vals[valid],
+            mode='lines',
+            line=dict(color=color, width=2),
+            name=y_label,
+            hovertemplate=f'P = %{{x:,.0f}} psia<br>{y_label} = %{{y:.4f}}<extra></extra>',
+        ))
+        # Vertical dashed line at Pb
+        fig.add_vline(
+            x=float(Pb),
+            line_dash='dash', line_color='red', line_width=1.5,
+            annotation_text=f'Pb = {Pb:.0f} psia',
+            annotation_position='top right',
+            annotation_font_color='red',
+        )
+        fig.update_layout(
+            title=dict(
+                text=f'{title} — {region_label}  '
+                     f'(API={API}°, GOR={GOR} scf/STB, T={T}°F)',
+                font=dict(size=13),
+            ),
+            xaxis=dict(title='Pressure [psia]', tickformat=',.0f'),
+            yaxis=dict(title=y_label),
+            height=450,
+            margin=dict(l=60, r=30, t=60, b=50),
+            hovermode='x unified',
+        )
+        return fig
 
-    props = [
-        ('Rs',   tbl['Rs'],   '#2196F3', 'Solution GOR $R_s$ [scf/STB]'),
-        ('Bo',   tbl['Bo'],   '#4CAF50', 'Oil FVF $B_o$ [RB/STB]'),
-        ('mu_o', tbl['mu_o'], '#FF5722', 'Viscosity $\\mu_o$ [cp]'),
-        ('co',   tbl['co'],   '#9C27B0', 'Oil Compressibility $c_o$ [psi$^{-1}$]'),
-    ]
+    fig_rs   = _make_fig(tbl['Rs'],   'Rs [scf/STB]', '#2196F3', 'Solution GOR Rs vs Pressure')
+    fig_bo   = _make_fig(tbl['Bo'],   'Bo [RB/STB]',  '#4CAF50', 'Oil FVF Bo vs Pressure')
+    fig_visc = _make_fig(tbl['mu_o'], 'μo [cp]',      '#FF5722', 'Oil Viscosity vs Pressure')
 
-    for ax, (key, vals, color, ylabel) in zip(axes, props):
-        # co is NaN below Pb — plot only valid values
-        valid = ~np.isnan(vals)
-        if valid.any():
-            ax.plot(P[valid], vals[valid], color=color, linewidth=2)
-        _add_pb_line(ax, Pb)
-        ax.set_xlabel('Pressure [psia]')
-        ax.set_ylabel(ylabel)
-        ax.legend(fontsize=8)
-        ax.xaxis.set_major_formatter(ticker.FuncFormatter(
-            lambda x, _: f'{x:,.0f}'))
-
-    fig.tight_layout()
-    return fig, axes
+    return fig_rs, fig_bo, fig_visc
 
 
 # ---------------------------------------------------------------------------
@@ -148,23 +172,21 @@ def plot_pvt_curves(API, GOR, T, gas_SG, region='global',
 
 def plot_regional_comparison(API, GOR, T, gas_SG):
     """
-    Two-panel figure:
-      Left:  bar chart of Pb across all five regional correlations
-      Right: Rs vs pressure overlay for all valid regions
+    Single-panel bar chart of bubble point pressure across all five regional
+    correlations.  The Rs vs pressure overlay has been removed.
 
     Returns
     -------
-    fig, axes : matplotlib Figure and axes [2]
+    fig, ax : matplotlib Figure and single Axes object
     """
     _apply_style()
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig, ax = plt.subplots(figsize=(9, 5))
     fig.suptitle(
-        f'Regional Correlation Comparison\n'
-        f'API={API}°, GOR={GOR} scf/STB, T={T}°F, $\\gamma_g$={gas_SG}',
+        f'Bubble Point — Regional Correlation Comparison\n'
+        f'API={API}°, GOR={GOR} scf/STB, T={T}°F, γg={gas_SG}',
         fontsize=11, y=1.02
     )
 
-    ax_bar = axes[0]
     regions = list(REGIONS.keys())
     pbs, flags = [], []
     for r in regions:
@@ -176,47 +198,30 @@ def plot_regional_comparison(API, GOR, T, gas_SG):
         '#BDBDBD' if flag else _REGION_COLORS[r]
         for r, flag in zip(regions, flags)
     ]
-    bars = ax_bar.bar(range(len(regions)), pbs, color=colors, width=0.6,
-                      edgecolor='white', linewidth=0.8)
-    ax_bar.set_xticks(range(len(regions)))
-    ax_bar.set_xticklabels(
+    bars = ax.bar(range(len(regions)), pbs, color=colors, width=0.6,
+                  edgecolor='white', linewidth=0.8)
+    ax.set_xticks(range(len(regions)))
+    ax.set_xticklabels(
         [_REGION_LABELS[r].split('\n')[0] for r in regions],
-        rotation=30, ha='right', fontsize=8
+        rotation=30, ha='right', fontsize=9
     )
-    ax_bar.set_ylabel('Bubble Point Pressure $P_b$ [psia]')
-    ax_bar.set_title('Bubble Point — Regional Comparison')
+    ax.set_ylabel('Bubble Point Pressure Pb [psia]')
+    ax.set_title('Bubble Point by Region')
 
     for bar, pb, flag in zip(bars, pbs, flags):
         label = f'{pb:.0f}' + (' *' if flag else '')
-        ax_bar.text(bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + max(pbs) * 0.01,
-                    label, ha='center', va='bottom', fontsize=8)
+        ax.text(bar.get_x() + bar.get_width() / 2,
+                bar.get_height() + max(pbs) * 0.01,
+                label, ha='center', va='bottom', fontsize=9)
 
     if any(flags):
-        ax_bar.text(0.02, 0.97,
-                    '* clipped to 14.7 psia\n  (out of development range)',
-                    transform=ax_bar.transAxes, fontsize=7,
-                    va='top', color='#757575', style='italic')
-
-    ax_rs = axes[1]
-    for r in regions:
-        pb = bubble_point(API, GOR, T, gas_SG, region=r)
-        if pb <= 14.8:
-            continue
-        tbl = pvt_table(API, GOR, T, gas_SG, region=r)
-        label = _REGION_LABELS[r].replace('\n', ' ')
-        ax_rs.plot(tbl['P'], tbl['Rs'],
-                   color=_REGION_COLORS[r], linewidth=1.8, label=label)
-
-    ax_rs.set_xlabel('Pressure [psia]')
-    ax_rs.set_ylabel('Solution GOR $R_s$ [scf/STB]')
-    ax_rs.set_title('$R_s$ vs Pressure — Regional Overlay')
-    ax_rs.legend(fontsize=7, loc='upper left')
-    ax_rs.xaxis.set_major_formatter(ticker.FuncFormatter(
-        lambda x, _: f'{x:,.0f}'))
+        ax.text(0.02, 0.97,
+                '* clipped to 14.7 psia\n  (out of development range)',
+                transform=ax.transAxes, fontsize=7,
+                va='top', color='#757575', style='italic')
 
     fig.tight_layout()
-    return fig, axes
+    return fig, ax
 
 
 # ---------------------------------------------------------------------------
@@ -748,6 +753,76 @@ def plot_pvt_3d(API=35, GOR=500, gas_SG=0.65,
         z_label='V [ft³/lbmol]',
         colorscale='Turbo',
     )
+
+
+# ---------------------------------------------------------------------------
+# Pxy DIAGRAM (PLOTLY)
+# ---------------------------------------------------------------------------
+
+def plot_pxy_plotly(pxy_dict):
+    """
+    Interactive Plotly Pxy diagram from pxy_diagram_fugacity() output.
+
+    Parameters
+    ----------
+    pxy_dict : dict — output of eos.pxy_diagram_fugacity()
+
+    Returns
+    -------
+    plotly Figure
+    """
+    x_A   = pxy_dict['x_A']
+    P_bub = pxy_dict['P_bubble']
+    P_dew = pxy_dict['P_dew']
+    cA    = pxy_dict['comp_A']
+    cB    = pxy_dict['comp_B']
+    T_F   = pxy_dict['T_F']
+
+    fig = go.Figure()
+
+    bub_mask = ~np.isnan(P_bub)
+    dew_mask = ~np.isnan(P_dew)
+
+    if bub_mask.any():
+        fig.add_trace(go.Scatter(
+            x=x_A[bub_mask], y=P_bub[bub_mask],
+            mode='lines+markers',
+            name='Bubble curve',
+            line=dict(color='#1565C0', width=2),
+            marker=dict(size=4),
+            hovertemplate=(
+                f'z({cA}) = %{{x:.3f}}<br>'
+                f'Bubble P = %{{y:,.1f}} psia<extra></extra>'
+            ),
+        ))
+
+    if dew_mask.any():
+        fig.add_trace(go.Scatter(
+            x=x_A[dew_mask], y=P_dew[dew_mask],
+            mode='lines+markers',
+            name='Dew curve',
+            line=dict(color='#C62828', width=2, dash='dash'),
+            marker=dict(size=4),
+            hovertemplate=(
+                f'z({cA}) = %{{x:.3f}}<br>'
+                f'Dew P = %{{y:,.1f}} psia<extra></extra>'
+            ),
+        ))
+
+    fig.update_layout(
+        title=dict(
+            text=f'Pxy Diagram — {cA} / {cB} at T = {T_F:.0f} degF  '
+                 f'(PR EOS fugacity)',
+            font=dict(size=13),
+        ),
+        xaxis=dict(title=f'Mole fraction {cA} [-]', range=[0, 1]),
+        yaxis=dict(title='Pressure [psia]', tickformat=',.0f'),
+        height=500,
+        margin=dict(l=60, r=30, t=70, b=60),
+        hovermode='x unified',
+        legend=dict(x=0.02, y=0.98),
+    )
+    return fig
 
 
 # ---------------------------------------------------------------------------
