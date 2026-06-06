@@ -8,19 +8,16 @@ Run with:
 
 Tabs
 ----
-  1. Correlations  — Rs, Bo, co, viscosity curves + regional comparison
+  1. Oil PVT       — Rs, Bo, viscosity, compressibility curves + PVT table
   2. Gas PVT       — Gas Z-factor, Bg, μg, ρg from gas correlations
-  3. EOS           — PR EOS Z-factor, density, phase envelope
-  4. 3D Surfaces   — interactive Plotly 3D (Bo, viscosity, Z, PVT)
-  5. Phase         — PR fugacity phase envelope
-  6. Pxy Diagram   — Binary Pxy diagram via PR EOS fugacity
-  7. Composition   — enter real mole fractions from a lab PVT report
-  8. About         — methodology, sources, references
+  3. Phase Behavior — PT phase envelope + Binary Pxy diagram
+  4. About          — methodology, sources, references
 """
 
 import streamlit as st
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import matplotlib
 matplotlib.use('Agg')
 
@@ -29,12 +26,11 @@ from correlations import REGIONS, pvt_table, bubble_point, check_range, solution
 from correlations import formation_volume_factor, viscosity, oil_compressibility
 from eos import (
     pseudo_components, build_mixture, characterize_c7plus,
-    eos_table, pr_bubble_point, pr_flash,
-    michelsen_stability_test, PURE_COMPONENTS,
-    pxy_diagram_fugacity,
+    pr_bubble_point, pr_bubble_point_fugacity, pr_phase_envelope,
+    pxy_diagram_fugacity, PURE_COMPONENTS,
 )
 from gas_pvt import gas_pvt_table
-import plotting as P
+import plotting as _P
 
 # ---------------------------------------------------------------------------
 # PAGE CONFIG
@@ -44,7 +40,7 @@ st.set_page_config(
     page_title="PVT Analyzer",
     page_icon=None,
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown("""
@@ -92,48 +88,16 @@ st.markdown("""
 
 
 # ---------------------------------------------------------------------------
-# SIDEBAR — FLUID INPUTS
+# REGION LABELS
 # ---------------------------------------------------------------------------
 
-with st.sidebar:
-    st.header("Fluid Properties")
-
-    API    = st.slider("API Gravity [°API]", 15, 60, 35, 1,
-                       help="Stock-tank oil API gravity.")
-    GOR    = st.slider("Surface GOR [scf/STB]", 50, 2000, 500, 25,
-                       help="Gas-oil ratio at surface (stock-tank) conditions.")
-    T      = st.slider("Reservoir Temperature [°F]", 80, 320, 180, 5)
-    gas_SG = st.slider("Gas Specific Gravity [-]", 0.55, 0.90, 0.65, 0.01,
-                       help="Gas SG relative to air = 1.0.")
-
-    st.divider()
-    st.subheader("Correlation Region")
-    region = st.selectbox(
-        "Regional correlation",
-        list(REGIONS.keys()),
-        index=3,
-        format_func=lambda r: REGIONS[r].split('—')[0].strip(),
-    )
-
-    st.divider()
-    st.subheader("Vasquez & Beggs Separator Correction")
-    with st.expander("What is this?", expanded=False):
-        st.markdown(
-            "V&B correlations were developed at a reference separator pressure "
-            "of 100 psia. If your gas SG was measured at a different separator "
-            "pressure, enter those conditions here to correct gamma_g before "
-            "applying the correlation."
-        )
-    use_sep_corr = st.checkbox("Apply separator correction (global region only)")
-    T_sp = st.number_input("Separator temperature [°F]", 60.0, 200.0, 80.0,
-                            disabled=not use_sep_corr)
-    P_sp = st.number_input("Separator pressure [psia]", 14.7, 500.0, 114.7,
-                            disabled=not use_sep_corr)
-
-    st.divider()
-    st.caption("Bulk inputs are used for correlations and the pseudo-component "
-               "EOS fallback. For real compositions, use the Composition tab.")
-
+_REGION_DISPLAY = {
+    "western_usa"   : "Standing (1947) — Western USA",
+    "middle_east"   : "Al-Marhoun (1988) — Middle East",
+    "north_sea"     : "Glaso (1980) — North Sea",
+    "global"        : "Vasquez & Beggs (1980) — Global",
+    "gulf_of_mexico": "Petrosky & Farshad (1993) — Gulf of Mexico",
+}
 
 # ---------------------------------------------------------------------------
 # CACHED COMPUTATIONS
@@ -150,79 +114,306 @@ def compute_pseudo(API, GOR, gas_SG):
 
 
 @st.cache_data(show_spinner=False)
-def compute_gas_pvt(gas_SG, T, y_CO2, y_H2S, fluid_type, z_method):
+def compute_gas_pvt(gas_SG, T, y_CO2, y_H2S, fluid_type):
     return gas_pvt_table(
         gas_SG=gas_SG, T_F=T,
         y_CO2=y_CO2, y_H2S=y_H2S,
         fluid_type=fluid_type,
-        z_method=z_method,
+        z_method='hall_yarborough',
         P_min=14.7, P_max=10000.0, n_points=200,
     )
 
 
 @st.cache_data(show_spinner=False)
-def _compute_bo_grid_cached(API, GOR, gas_SG, T_range, P_range, region, n_T, n_P):
-    return P._compute_bo_grid(API, GOR, gas_SG, T_range, P_range, region, n_T, n_P)
+def compute_pvt_table_grid(API, GOR, T, gas_SG, region, T_sp, P_sp):
+    """Fixed 50-psia step PVT table for the Oil PVT tab."""
+    tbl    = pvt_table(API, GOR, T, gas_SG, region=region, T_sp=T_sp, P_sp=P_sp)
+    Pb_val = tbl['Pb']
+    P_max_tbl = int(np.ceil(max(Pb_val * 2.5, 6000) / 50) * 50)
+    P_arr  = np.arange(50, P_max_tbl + 1, 50)
+    Rs_arr = np.array([float(solution_gor(np.array([p]), API, T, gas_SG, Pb_val, GOR, region=region)[0])
+                       for p in P_arr])
+    Bo_arr = np.array([float(formation_volume_factor(np.array([p]), API, T, gas_SG, Pb_val, GOR, region=region)[0])
+                       for p in P_arr])
+    mu_arr = np.array([float(viscosity(np.array([p]), API, T, gas_SG, Pb_val, GOR, region=region)[0])
+                       for p in P_arr])
+    co_arr = np.array([float(oil_compressibility(np.array([p]), API, T, gas_SG, Pb_val, GOR)[0])
+                       for p in P_arr])
+    return Pb_val, P_arr, Rs_arr, Bo_arr, mu_arr, co_arr
 
 
 @st.cache_data(show_spinner=False)
-def _compute_visc_grid_cached(API, GOR, gas_SG, T_range, P_range, region, n_T, n_P):
-    return P._compute_visc_grid(API, GOR, gas_SG, T_range, P_range, region, n_T, n_P)
-
-
-@st.cache_data(show_spinner=False)
-def _compute_z_grid_cached(API, GOR, gas_SG, T_range, P_range, n_T, n_P):
-    return P._compute_z_grid(API, GOR, gas_SG, T_range, P_range, n_T, n_P)
-
-
-@st.cache_data(show_spinner=False)
-def _compute_pvt_grid_cached(API, GOR, gas_SG, T_range, P_range, n_T, n_P):
-    return P._compute_pvt_grid(API, GOR, gas_SG, T_range, P_range, n_T, n_P)
+def compute_phase_envelope(comp_tuple, T_range=(50.0, 400.0)):
+    """Phase envelope — cache on a hashable key."""
+    # comp_tuple: tuple of (name, z, Tc, Pc, omega, MW) for each component
+    names  = [r[0] for r in comp_tuple]
+    z      = np.array([r[1] for r in comp_tuple])
+    Tc     = np.array([r[2] for r in comp_tuple])
+    Pc     = np.array([r[3] for r in comp_tuple])
+    omega  = np.array([r[4] for r in comp_tuple])
+    MW     = np.array([r[5] for r in comp_tuple])
+    mixture = {'names': names, 'z': z, 'Tc': Tc, 'Pc': Pc, 'omega': omega, 'MW': MW}
+    return pr_phase_envelope(mixture, T_range=T_range, n_T=60)
 
 
 @st.cache_data(show_spinner=False)
 def compute_pxy(comp_A, comp_B, T_F, P_lo, P_hi, n_x):
     return pxy_diagram_fugacity(comp_A, comp_B, T_F,
-                                 P_range=(P_lo, P_hi), n_x=n_x)
+                                P_range=(P_lo, P_hi), n_x=n_x)
 
 
 # ---------------------------------------------------------------------------
-# COMPUTE SHARED STATE (runs on every slider change — no button guard)
-# ---------------------------------------------------------------------------
-
-sep_kw = {'T_sp': T_sp, 'P_sp': P_sp} if use_sep_corr else {'T_sp': 60.0, 'P_sp': 114.7}
-
-tbl    = compute_pvt(API, GOR, T, gas_SG, region, **sep_kw)
-pseudo = compute_pseudo(API, GOR, gas_SG)
-Pb_corr = tbl['Pb']
-Pb_eos  = pr_bubble_point(pseudo, T)
-
-# Show any range warnings in the sidebar
-range_warns = check_range(GOR, T, API, region)
-if range_warns:
-    with st.sidebar:
-        st.divider()
-        for w in range_warns:
-            st.warning(w)
-
-
-# ---------------------------------------------------------------------------
-# HEADER METRICS
+# TOP-OF-PAGE INPUTS
 # ---------------------------------------------------------------------------
 
 st.title("PVT Analyzer")
 st.caption(
     "Empirical correlations (Standing, Al-Marhoun, Glaso, Vasquez & Beggs, "
     "Petrosky & Farshad) + Peng-Robinson EOS with real or pseudo-compositions. "
-    "Gas PVT: Hall-Yarborough (1974) / DPR (1974) Z-factor, Lee-Gonzalez-Eakin (1966) viscosity."
+    "Gas PVT: Hall-Yarborough (1974) Z-factor, Lee-Gonzalez-Eakin (1966) viscosity."
 )
 
-c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("API Gravity",    f"{API} °API")
-c2.metric("Surface GOR",    f"{GOR} scf/STB")
-c3.metric("Temperature",    f"{T} °F")
-c4.metric("Pb (Corr.)",     f"{Pb_corr:.0f} psia")
-c5.metric("Pb (EOS Wilson)",f"{Pb_eos:.0f} psia" if not np.isnan(Pb_eos) else "—")
+# ── A. Region selector ──────────────────────────────────────────────────────
+region = st.selectbox(
+    "Select Regional Correlation:",
+    list(_REGION_DISPLAY.keys()),
+    index=3,
+    format_func=lambda r: _REGION_DISPLAY[r],
+)
+
+# ── B. Fluid inputs row ─────────────────────────────────────────────────────
+f_col1, f_col2, f_col3, f_col4 = st.columns(4)
+with f_col1:
+    API = st.number_input("API Gravity [°API]", min_value=10.0, max_value=70.0,
+                          value=35.0, step=0.1,
+                          help="Stock-tank oil API gravity.")
+with f_col2:
+    GOR = st.number_input("Surface GOR [scf/STB]", min_value=10.0, max_value=5000.0,
+                          value=500.0, step=1.0,
+                          help="Gas-oil ratio at surface (stock-tank) conditions.")
+with f_col3:
+    T = st.number_input("Reservoir Temperature [°F]", min_value=60.0, max_value=400.0,
+                        value=180.0, step=0.5)
+with f_col4:
+    gas_SG = st.number_input("Gas Specific Gravity [-]", min_value=0.50, max_value=1.50,
+                             value=0.65, step=0.001,
+                             help="Gas SG relative to air = 1.0.")
+
+# ── C. Composition expander ─────────────────────────────────────────────────
+_COMP_DESCRIPTIONS = {
+    'C1'  : 'Methane: primary natural gas component',
+    'C2'  : 'Ethane: light gas, common in associated gas',
+    'C3'  : 'Propane: liquefies under moderate pressure',
+    'nC4' : 'n-Butane: NGLs fraction',
+    'iC4' : 'iso-Butane: branched C4 isomer',
+    'nC5' : 'n-Pentane: lightest liquid alkane at surface',
+    'iC5' : 'iso-Pentane: branched C5 isomer',
+    'nC6' : 'n-Hexane: lower end of gasoline fraction',
+    'CO2' : 'Carbon dioxide: non-hydrocarbon contaminant',
+    'N2'  : 'Nitrogen: inert non-hydrocarbon',
+    'H2S' : 'Hydrogen sulfide: toxic acid gas',
+    'C7+' : 'Heptanes-plus: the oil fraction (all components heavier than C6)',
+}
+
+_COMP_ORDER = ['C1', 'C2', 'C3', 'nC4', 'iC4', 'nC5', 'iC5', 'nC6',
+               'CO2', 'N2', 'H2S', 'C7+']
+
+# Preset fluid templates (mol%)
+_PRESETS = {
+    'None (enter manually)': None,
+    'Typical GOM Black Oil': {
+        'C1': 45.0, 'C2': 5.0, 'C3': 5.0, 'nC4': 3.0, 'iC4': 1.0,
+        'nC5': 1.0, 'iC5': 0.5, 'nC6': 1.0, 'CO2': 0.5, 'N2': 0.0,
+        'H2S': 0.0, 'C7+': 38.0, 'MW_c7': 215.0, 'SG_c7': 0.87,
+    },
+    'Typical North Sea Volatile Oil': {
+        'C1': 55.0, 'C2': 8.0, 'C3': 6.0, 'nC4': 3.0, 'iC4': 1.5,
+        'nC5': 1.5, 'iC5': 0.5, 'nC6': 1.0, 'CO2': 1.5, 'N2': 0.5,
+        'H2S': 0.0, 'C7+': 21.5, 'MW_c7': 195.0, 'SG_c7': 0.84,
+    },
+    'Typical Middle East Crude': {
+        'C1': 35.0, 'C2': 4.0, 'C3': 4.0, 'nC4': 2.5, 'iC4': 0.5,
+        'nC5': 1.5, 'iC5': 0.5, 'nC6': 1.5, 'CO2': 2.0, 'N2': 0.5,
+        'H2S': 1.0, 'C7+': 47.0, 'MW_c7': 230.0, 'SG_c7': 0.89,
+    },
+    'Lean Dry Gas': {
+        'C1': 85.0, 'C2': 8.0, 'C3': 3.0, 'nC4': 1.0, 'iC4': 0.5,
+        'nC5': 0.3, 'iC5': 0.2, 'nC6': 0.2, 'CO2': 1.0, 'N2': 0.8,
+        'H2S': 0.0, 'C7+': 0.0, 'MW_c7': 100.0, 'SG_c7': 0.74,
+    },
+}
+
+with st.expander("Enter Fluid Composition (Mole Fractions)"):
+
+    # ── Preset selector ──────────────────────────────────────────────────────
+    preset_choice = st.selectbox(
+        "Load a preset composition:",
+        list(_PRESETS.keys()),
+        key='preset_choice',
+    )
+    preset = _PRESETS[preset_choice]
+
+    # ── CSV upload ───────────────────────────────────────────────────────────
+    st.markdown("**Or upload a CSV file** (two columns: `component`, `mole_fraction` or `mol_pct`)")
+    uploaded_file = st.file_uploader(
+        "Upload composition CSV",
+        type=["csv"],
+        key='comp_csv',
+        label_visibility='collapsed',
+    )
+
+    # Parse uploaded CSV if provided
+    _csv_values = {}
+    _csv_mw_c7 = None
+    _csv_sg_c7 = None
+    if uploaded_file is not None:
+        try:
+            import io
+            _df_upload = pd.read_csv(io.StringIO(uploaded_file.read().decode('utf-8')))
+            _df_upload.columns = [c.strip().lower() for c in _df_upload.columns]
+            val_col = 'mole_fraction' if 'mole_fraction' in _df_upload.columns else \
+                      'mol_pct'       if 'mol_pct'       in _df_upload.columns else \
+                      _df_upload.columns[1]
+            comp_col = _df_upload.columns[0]
+            for _, row in _df_upload.iterrows():
+                comp = str(row[comp_col]).strip()
+                val  = float(row[val_col])
+                # Normalise to mol%
+                if val <= 1.0:
+                    val *= 100.0
+                if comp.lower() in ('mw_c7', 'mw c7', 'c7+ mw', 'c7_mw'):
+                    _csv_mw_c7 = val
+                elif comp.lower() in ('sg_c7', 'sg c7', 'c7+ sg', 'c7_sg'):
+                    _csv_sg_c7 = val
+                elif comp in _COMP_ORDER:
+                    _csv_values[comp] = val
+            st.success(f"Loaded {len(_csv_values)} components from CSV.")
+        except Exception as e:
+            st.error(f"Could not parse CSV: {e}")
+
+    # ── Manual inputs ────────────────────────────────────────────────────────
+    st.markdown("**Component mole fractions [mol%]:**")
+    col_a, col_b, col_c = st.columns(3)
+    comp_inputs_pct = {}
+
+    non_c7_comps = [c for c in _COMP_ORDER if c != 'C7+']
+    _col_assignments = [
+        (col_a, non_c7_comps[0:4]),
+        (col_b, non_c7_comps[4:8]),
+        (col_c, non_c7_comps[8:11]),
+    ]
+
+    for col_obj, comp_list in _col_assignments:
+        with col_obj:
+            for comp in comp_list:
+                # Priority: CSV upload > preset > zero default
+                if comp in _csv_values:
+                    default_val = _csv_values[comp]
+                elif preset and comp in preset:
+                    default_val = float(preset[comp])
+                else:
+                    default_val = 0.0
+                st.markdown(f"**{comp}** — *{_COMP_DESCRIPTIONS[comp]}*")
+                comp_inputs_pct[comp] = st.number_input(
+                    f"{comp} [mol%]",
+                    min_value=0.0, max_value=100.0,
+                    value=default_val,
+                    step=0.01,
+                    key=f'comp_{comp}',
+                    label_visibility='collapsed',
+                )
+
+    with col_c:
+        c7_default = _csv_values.get('C7+', preset['C7+'] if preset else 0.0)
+        st.markdown(f"**C7+** — *{_COMP_DESCRIPTIONS['C7+']}*")
+        comp_inputs_pct['C7+'] = st.number_input(
+            "C7+ [mol%]", min_value=0.0, max_value=100.0,
+            value=float(c7_default), step=0.01,
+            key='comp_C7plus', label_visibility='collapsed',
+        )
+        mw_default = _csv_mw_c7 if _csv_mw_c7 else (preset.get('MW_c7', 215.0) if preset else 215.0)
+        sg_default = _csv_sg_c7 if _csv_sg_c7 else (preset.get('SG_c7', 0.87)  if preset else 0.87)
+        mw_col, sg_col = st.columns(2)
+        with mw_col:
+            MW_c7 = st.number_input("C7+ MW [lb/lbmol]", 90.0, 600.0,
+                                    float(mw_default), 1.0, key='c7_MW')
+        with sg_col:
+            SG_c7 = st.number_input("C7+ SG [-]", 0.60, 1.20,
+                                    float(sg_default), 0.001, key='c7_SG')
+
+    total_pct = sum(comp_inputs_pct.values())
+    if abs(total_pct - 100.0) < 1.0:
+        st.success(f"Mole fraction sum: {total_pct:.2f}% — composition valid.")
+    else:
+        st.warning(
+            f"Mole fractions sum to {total_pct:.2f}%. Must sum to 100% (±1%) "
+            "to use real composition for EOS calculations."
+        )
+
+    st.caption(
+        "CSV format: two columns — `component` and `mole_fraction` (0–1) or `mol_pct` (0–100). "
+        "Accepted component names: C1, C2, C3, nC4, iC4, nC5, iC5, nC6, CO2, N2, H2S, C7+. "
+        "Optionally include rows named MW_c7 and SG_c7 for C7+ characterization."
+    )
+
+# Determine if composition is valid
+_comp_valid = abs(total_pct - 100.0) < 1.0
+
+# Build mixture if composition is valid
+if _comp_valid:
+    _comp_dict = {k: v / 100.0 for k, v in comp_inputs_pct.items() if v > 1e-6}
+    _total_frac = sum(_comp_dict.values())
+    _comp_dict_norm = {k: v / _total_frac for k, v in _comp_dict.items()}
+    _c7_props = characterize_c7plus(MW_c7, SG_c7)
+    _mixture  = build_mixture(_comp_dict_norm, c7plus_props=_c7_props)
+    # Hashable tuple for caching
+    _mix_tuple = tuple(
+        (_mixture['names'][i],
+         float(_mixture['z'][i]),
+         float(_mixture['Tc'][i]),
+         float(_mixture['Pc'][i]),
+         float(_mixture['omega'][i]),
+         float(_mixture['MW'][i]))
+        for i in range(len(_mixture['names']))
+    )
+else:
+    _mixture  = None
+    _mix_tuple = None
+
+# ── Shared PVT computation ─────────────────────────────────────────────────
+# Vasquez & Beggs separator correction — used internally when global region
+_T_sp = 60.0
+_P_sp = 114.7
+
+tbl     = compute_pvt(API, GOR, T, gas_SG, region, _T_sp, _P_sp)
+pseudo  = compute_pseudo(API, GOR, gas_SG)
+Pb_corr = tbl['Pb']
+Pb_eos  = pr_bubble_point(pseudo, T)
+
+# EOS bubble point from real composition if available
+if _comp_valid and _mixture is not None:
+    _Pb_fug, _conv_fug, _wb_fug = pr_bubble_point_fugacity(_mixture, T)
+    Pb_eos_display = f"{_Pb_fug:.0f} psia" if _conv_fug else "Not converged"
+else:
+    Pb_eos_display = f"{Pb_eos:.0f} psia" if not np.isnan(Pb_eos) else "—"
+
+# Range warnings below region selector
+range_warns = check_range(GOR, T, API, region)
+if range_warns:
+    for w in range_warns:
+        st.warning(w)
+
+# PVT table warnings
+if tbl['warnings']:
+    for w in tbl['warnings']:
+        st.warning(w)
+
+# ── D. Key metrics row ──────────────────────────────────────────────────────
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Bubble Point (Correlation)", f"{Pb_corr:.0f} psia")
+m2.metric("Bubble Point (PR EOS)", Pb_eos_display)
+m3.metric("Reservoir Temperature", f"{T} °F")
+m4.metric("Gas Gravity", f"{gas_SG:.3f}")
 
 st.divider()
 
@@ -231,131 +422,85 @@ st.divider()
 # TABS
 # ---------------------------------------------------------------------------
 
-tabs = st.tabs([
-    "Correlations",
-    "Gas PVT",
-    "EOS",
-    "3D Surfaces",
-    "Phase",
-    "Pxy Diagram",
-    "Composition",
-    "About",
-])
+tabs = st.tabs(["Oil PVT", "Gas PVT", "Phase Behavior", "About"])
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 1 — CORRELATIONS
+# TAB 1 — OIL PVT
 # ════════════════════════════════════════════════════════════════════════════
 
 with tabs[0]:
-    st.subheader("Empirical Oil PVT Correlations")
+    st.subheader("Oil PVT Properties")
 
-    # Show any range warnings as st.warning() — not printed to console
-    if tbl['warnings']:
-        for w in tbl['warnings']:
-            st.warning(w)
+    region_label = _REGION_DISPLAY[region]
 
-    st.markdown(
-        '<div class="assumption-box">'
-        '<b>Viscosity:</b> Western USA uses Beal (1946) dead oil + Chew & Connally (1959) '
-        'saturated. All other regions use Beggs & Robinson (1975). '
-        'Undersaturated correction: Vasquez & Beggs (1980) for all regions. '
-        '<b>Compressibility:</b> Vasquez & Beggs (1980) SPE-6719 Eq. 2-47 '
-        '(co = (5Rs + 17.2T - 1180γg + 12.61API - 1433) / (10^5 P)); '
-        'defined only above Pb. '
-        'Petrosky & Farshad results are flagged if Pb <= 14.7 psia '
-        '(outside development range).'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    # ── Individual full-width Plotly PVT curves ──
-    fig_rs, fig_bo, fig_visc = P.plot_pvt_curves_plotly(
-        API, GOR, T, gas_SG, region=region, **sep_kw
+    # Retrieve plotly PVT curves
+    fig_rs, fig_bo, fig_visc = _P.plot_pvt_curves_plotly(
+        API, GOR, T, gas_SG, region=region, T_sp=_T_sp, P_sp=_P_sp
     )
     st.plotly_chart(fig_rs,   use_container_width=True)
     st.plotly_chart(fig_bo,   use_container_width=True)
     st.plotly_chart(fig_visc, use_container_width=True)
 
+    # Oil Compressibility co — above Pb only, using plotly directly
+    Pb_val, P_arr, Rs_arr, Bo_arr, mu_arr, co_arr = compute_pvt_table_grid(
+        API, GOR, T, gas_SG, region, _T_sp, _P_sp
+    )
+    co_mask = ~np.isnan(co_arr)
+    if co_mask.any():
+        fig_co = go.Figure()
+        fig_co.add_trace(go.Scatter(
+            x=P_arr[co_mask], y=co_arr[co_mask],
+            mode='lines',
+            line=dict(color='#6A1B9A', width=2),
+            name='co [psi⁻¹]',
+            hovertemplate='P = %{x:,.0f} psia<br>co = %{y:.3e} psi⁻¹<extra></extra>',
+        ))
+        fig_co.add_vline(
+            x=float(Pb_val),
+            line_dash='dash', line_color='red', line_width=1.5,
+            annotation_text=f'Pb = {Pb_val:.0f} psia',
+            annotation_position='top left',
+            annotation_font_color='red',
+        )
+        fig_co.update_layout(
+            title=dict(
+                text=f'Oil Compressibility co vs Pressure — {region_label}  '
+                     f'(API={API}°, GOR={GOR} scf/STB, T={T}°F)',
+                font=dict(size=13),
+            ),
+            xaxis=dict(title='Pressure [psia]', tickformat=',.0f'),
+            yaxis=dict(title='co [psi⁻¹]'),
+            height=450,
+            margin=dict(l=60, r=30, t=60, b=50),
+            hovermode='x unified',
+        )
+        st.plotly_chart(fig_co, use_container_width=True)
+
     st.divider()
 
-    # ── Bubble Point Summary table ──
-    st.markdown("**Bubble Point Summary**")
-    pb_data = []
-    for r in REGIONS:
-        pb   = bubble_point(API, GOR, T, gas_SG, region=r)
-        flag = " (out-of-range)" if pb <= 14.8 else ""
-        pb_data.append({
-            'Region': REGIONS[r].split('—')[0].strip(),
-            'Pb [psia]': f"{pb:.0f}{flag}",
-        })
-    st.dataframe(pd.DataFrame(pb_data), use_container_width=True, hide_index=True)
-
-    st.markdown("**Selected region Pb**")
-    st.metric(REGIONS[region].split('—')[0].strip(), f"{Pb_corr:.1f} psia")
-
-    st.divider()
-
-    # ── Regional Comparison (bar chart only) ──
-    st.subheader("Regional Comparison")
-    fig_reg, _ = P.plot_regional_comparison(API, GOR, T, gas_SG)
-    st.pyplot(fig_reg, use_container_width=True)
-
-    st.divider()
-
-    # ── PVT Data Table (fixed pressure array) ──
+    # PVT Data Table
     st.subheader("PVT Data Table")
 
-    P_table = np.arange(50, 4001, 50)   # 50 to 4000 psia in 50 psia steps (79 rows)
-    Pb_val  = tbl['Pb']
-
-    # Compute properties at each fixed pressure
-    Rs_tbl  = np.array([float(solution_gor(np.array([p]), API, T, gas_SG, Pb_val, GOR, region=region)[0])
-                         for p in P_table])
-    Bo_tbl  = np.array([float(formation_volume_factor(np.array([p]), API, T, gas_SG, Pb_val, GOR, region=region)[0])
-                         for p in P_table])
-    mu_tbl  = np.array([float(viscosity(np.array([p]), API, T, gas_SG, Pb_val, GOR, region=region)[0])
-                         for p in P_table])
-    co_tbl  = np.array([float(oil_compressibility(np.array([p]), API, T, gas_SG, Pb_val, GOR)[0])
-                         for p in P_table])
-
     df_tbl = pd.DataFrame({
-        'P [psia]'                              : P_table,
-        'T [°F]'                              : T,
-        'Rs [scf/STB] — Solution GOR'           : np.round(Rs_tbl, 2),
-        'Bo [RB/STB] — Oil FVF'                 : np.round(Bo_tbl, 4),
-        'μo [cp] — Oil viscosity'               : np.round(mu_tbl, 4),
-        'co [psi⁻¹] — Compressibility'          : co_tbl,
+        'P [psia]'                     : P_arr,
+        'T [°F]'                       : T,
+        'Rs [scf/STB]'                 : np.round(Rs_arr, 2),
+        'Bo [RB/STB]'                  : np.round(Bo_arr, 4),
+        'μo [cp]'                      : np.round(mu_arr, 4),
+        'co [psi⁻¹]'                   : co_arr,
     })
 
-    # Format co column — NaN shown as "< Pb"
     df_display = df_tbl.copy()
-    df_display['co [psi⁻¹] — Compressibility'] = df_tbl['co [psi⁻¹] — Compressibility'].apply(
+    df_display['co [psi⁻¹]'] = df_tbl['co [psi⁻¹]'].apply(
         lambda v: f"{v:.3e}" if not np.isnan(v) else "< Pb"
     )
 
     st.dataframe(df_display, use_container_width=True, height=350, hide_index=True)
 
-    with st.expander("What do these columns mean?"):
-        st.markdown(
-            "- **P [psia]**: Reservoir pressure at which properties are evaluated.\n"
-            "- **T [°F]**: Reservoir temperature, constant throughout — it is a parameter, "
-            "not a variable in this pressure sweep.\n"
-            "- **Rs [scf/STB]**: Cubic feet of gas dissolved per stock-tank barrel of oil "
-            "at this pressure and reservoir T. Equal to the surface GOR when P >= Pb "
-            "(all gas remains dissolved).\n"
-            "- **Bo [RB/STB]**: Volume of oil plus dissolved gas at reservoir conditions "
-            "per barrel at stock-tank conditions; always >= 1.0.\n"
-            "- **μo [cp]**: Dynamic viscosity of reservoir oil in centipoise; decreases as "
-            "dissolved gas increases below Pb.\n"
-            "- **co [psi⁻¹]**: Isothermal compressibility of undersaturated oil above the "
-            "bubble point. Shown as '< Pb' when pressure is below the bubble point "
-            f"(Pb = {Pb_val:.0f} psia) where this correlation is undefined."
-        )
-
-    # Download button
+    # Download CSV
     csv_tbl = df_tbl.copy()
-    csv_tbl['co [psi⁻¹] — Compressibility'] = csv_tbl['co [psi⁻¹] — Compressibility'].fillna('')
+    csv_tbl['co [psi⁻¹]'] = csv_tbl['co [psi⁻¹]'].fillna('')
     st.download_button(
         "Download PVT table as CSV",
         csv_tbl.to_csv(index=False),
@@ -371,74 +516,30 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("Gas PVT Properties")
 
-    st.markdown(
-        '<div class="source-box">'
-        '<b>Pseudocritical properties:</b> '
-        'Sutton (1985) SPE-14265 (dry gas) or Standing (1977) (gas condensate). '
-        'Acid-gas correction: Wichert & Aziz (1972) Hydrocarbon Processing, May 1972. '
-        '<b>Z-factor:</b> Hall & Yarborough (1974) SPE-3350-PA (Newton-Raphson) '
-        'or Dranchuk, Purvis & Robinson (1974) IP 74-008. '
-        '<b>Viscosity:</b> Lee, Gonzalez & Eakin (1966) SPE-1340-PA. '
-        '<b>Bg</b> from real-gas law. <b>cg</b> by numerical dZ/dP.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    g_col1, g_col2, g_col3 = st.columns(3)
-
-    with g_col1:
-        st.markdown("**Gas Description**")
-        gas_SG_g    = st.slider("Gas SG [-]", 0.55, 1.20, 0.65, 0.01, key='g_sg')
-        T_g         = st.slider("Temperature [°F]", 80, 320, 200, 5,    key='g_T')
-        fluid_type  = st.selectbox("Fluid type",
-                                    ["dry_gas", "gas_condensate"],
-                                    format_func=lambda x: x.replace('_', ' ').title(),
-                                    key='g_ft')
-
-    with g_col2:
-        st.markdown("**Acid Gas Fractions**")
-        y_CO2 = st.slider("CO2 mole fraction [-]", 0.0, 0.30, 0.0, 0.01, key='g_co2')
-        y_H2S = st.slider("H2S mole fraction [-]", 0.0, 0.30, 0.0, 0.01, key='g_h2s')
-        if y_CO2 + y_H2S > 0.0:
-            st.info(f"Wichert-Aziz (1972) acid-gas correction will be applied "
-                    f"(A = {y_CO2+y_H2S:.3f}).")
-
-    with g_col3:
-        st.markdown("**Z-Factor Method**")
-        z_method = st.radio(
-            "Method",
-            ["hall_yarborough", "dpr"],
-            format_func=lambda x: {
-                "hall_yarborough": "Hall-Yarborough (1974) [primary]",
-                "dpr":             "Dranchuk-Purvis-Robinson (1974) [alternative]",
-            }[x],
-            key='g_zmethod',
-        )
-        if z_method == "dpr":
-            st.info("DPR validity: 1.05 <= Tpr <= 3.0, 0 < Ppr <= 3.0. "
-                    "Values outside this range are extrapolations.")
+    # Gas inputs inline — 3 columns, no fluid-type selector
+    g_c1, g_c2, g_c3 = st.columns(3)
+    with g_c1:
+        gas_SG_g = st.number_input("Gas SG [-]", 0.50, 1.50, 0.65, 0.001, key='g_sg')
+    with g_c2:
+        y_CO2    = st.number_input("CO2 mole fraction [-]", 0.0, 0.50, 0.0, 0.001, key='g_co2')
+    with g_c3:
+        y_H2S    = st.number_input("H2S mole fraction [-]", 0.0, 0.50, 0.0, 0.001, key='g_h2s')
 
     with st.spinner("Computing gas PVT..."):
-        gas_tbl = compute_gas_pvt(gas_SG_g, T_g, y_CO2, y_H2S, fluid_type, z_method)
+        gas_tbl = compute_gas_pvt(gas_SG_g, T, y_CO2, y_H2S, 'dry_gas')
 
-    # Show warnings
     for w in gas_tbl['warnings']:
         st.warning(w)
 
-    # Pseudocritical info
+    # Pseudocritical metrics
     Tpc_disp = gas_tbl['Tpc']
     Ppc_disp = gas_tbl['Ppc']
-    Tpr_disp = (T_g + 459.67) / Tpc_disp
-    st.markdown(
-        f'<div class="assumption-box">'
-        f'Tpc = {Tpc_disp:.2f} °R ({Tpc_disp - 459.67:.2f} °F)  |  '
-        f'Ppc = {Ppc_disp:.2f} psia  |  '
-        f'Tpr = {Tpr_disp:.4f}  |  Mg = {gas_tbl["Mg"]:.3f} lb/lbmol'
-        + (f'  |  Raw Tpc = {gas_tbl["Tpc_raw"]:.2f} °R (before Wichert-Aziz)'
-           if abs(gas_tbl["Tpc"] - gas_tbl["Tpc_raw"]) > 0.01 else '')
-        + '</div>',
-        unsafe_allow_html=True,
-    )
+    Tpr_disp = (T + 459.67) / Tpc_disp
+
+    pm1, pm2, pm3 = st.columns(3)
+    pm1.metric("Tpc", f"{Tpc_disp:.1f} °R  ({Tpc_disp - 459.67:.1f} °F)")
+    pm2.metric("Ppc", f"{Ppc_disp:.1f} psia")
+    pm3.metric("Tpr at reservoir T", f"{Tpr_disp:.4f}")
 
     if Tpr_disp < 1.05:
         st.error(
@@ -447,448 +548,253 @@ with tabs[1]:
             "Increase temperature or reduce gas SG."
         )
 
-    # 4-panel gas PVT plot
-    fig_gas, _ = P.plot_gas_pvt_curves(gas_tbl)
-    st.pyplot(fig_gas, use_container_width=True)
+    if y_CO2 + y_H2S > 0.0:
+        st.info(
+            f"Wichert-Aziz (1972) acid-gas correction applied "
+            f"(A = {y_CO2 + y_H2S:.3f})."
+        )
 
-    # Table
+    # Plotly Gas PVT charts
+    valid_mask = ~np.isnan(gas_tbl['Z'])
+    P_g  = gas_tbl['P'][valid_mask]
+    Z_g  = gas_tbl['Z'][valid_mask]
+    Bg_g = gas_tbl['Bg_ft3'][valid_mask]
+    mu_g = gas_tbl['mu_g'][valid_mask]
+    rho_g = gas_tbl['rho_g'][valid_mask]
+
+    def _gas_fig(x, y, y_label, color, title, hover_fmt='.5f'):
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=x, y=y, mode='lines',
+            line=dict(color=color, width=2),
+            name=y_label,
+            hovertemplate=f'P = %{{x:,.0f}} psia<br>{y_label} = %{{y:{hover_fmt}}}<extra></extra>',
+        ))
+        fig.update_layout(
+            title=dict(text=title, font=dict(size=13)),
+            xaxis=dict(title='Pressure [psia]', tickformat=',.0f'),
+            yaxis=dict(title=y_label),
+            height=450,
+            margin=dict(l=60, r=30, t=60, b=50),
+            hovermode='x unified',
+        )
+        return fig
+
+    st.plotly_chart(
+        _gas_fig(P_g, Z_g, 'Z-factor [-]', '#1565C0',
+                 f'Z-Factor vs Pressure — Gas SG={gas_SG_g:.3f}, T={T}°F'),
+        use_container_width=True,
+    )
+    st.plotly_chart(
+        _gas_fig(P_g, Bg_g, 'Bg [ft³/scf]', '#2E7D32',
+                 f'Gas FVF (Bg) vs Pressure — Gas SG={gas_SG_g:.3f}, T={T}°F',
+                 hover_fmt='.4e'),
+        use_container_width=True,
+    )
+    st.plotly_chart(
+        _gas_fig(P_g, mu_g, 'μg [cp]', '#C62828',
+                 f'Gas Viscosity vs Pressure — Gas SG={gas_SG_g:.3f}, T={T}°F'),
+        use_container_width=True,
+    )
+    st.plotly_chart(
+        _gas_fig(P_g, rho_g, 'ρg [lb/ft³]', '#6A1B9A',
+                 f'Gas Density vs Pressure — Gas SG={gas_SG_g:.3f}, T={T}°F'),
+        use_container_width=True,
+    )
+
     st.divider()
     st.subheader("Gas PVT Data Table")
-    valid_mask = ~np.isnan(gas_tbl['Z'])
-    df_gas = pd.DataFrame({
-        'P [psia]'      : gas_tbl['P'][valid_mask].round(1),
-        'Z [-]'         : gas_tbl['Z'][valid_mask].round(5),
-        'Bg [ft³/scf]'  : gas_tbl['Bg_ft3'][valid_mask],
-        'Bg [bbl/scf]'  : gas_tbl['Bg_bbl'][valid_mask],
-        'ρg [lb/ft³]'   : gas_tbl['rho_g'][valid_mask].round(4),
-        'μg [cp]'       : gas_tbl['mu_g'][valid_mask].round(6),
-        'cg [psi⁻¹]'    : gas_tbl['cg'][valid_mask],
-    })
-    # Format small numbers
-    for col in ['Bg [ft³/scf]', 'Bg [bbl/scf]', 'cg [psi⁻¹]']:
-        df_gas[col] = df_gas[col].apply(lambda v: f"{v:.4e}" if not np.isnan(v) else "")
 
-    st.dataframe(df_gas, use_container_width=True, height=300)
+    # Resample to 50-psia steps for a clean display table
+    from scipy.interpolate import interp1d
+    P_raw = gas_tbl['P'][valid_mask]
+    P_step = np.arange(50, int(P_raw.max()) + 1, 50)
+    def _interp(arr):
+        return interp1d(P_raw, arr, bounds_error=False, fill_value=np.nan)(P_step)
+    Z_step   = _interp(gas_tbl['Z'][valid_mask])
+    Bg_step  = _interp(gas_tbl['Bg_ft3'][valid_mask])
+    Bgb_step = _interp(gas_tbl['Bg_bbl'][valid_mask])
+    rho_step = _interp(gas_tbl['rho_g'][valid_mask])
+    mu_step  = _interp(gas_tbl['mu_g'][valid_mask])
+    cg_step  = _interp(gas_tbl['cg'][valid_mask])
+
+    df_gas = pd.DataFrame({
+        'P [psia]'     : P_step,
+        'Z [-]'        : np.round(Z_step, 5),
+        'Bg [ft³/scf]' : [f"{v:.4e}" if not np.isnan(v) else "" for v in Bg_step],
+        'Bg [bbl/scf]' : [f"{v:.4e}" if not np.isnan(v) else "" for v in Bgb_step],
+        'ρg [lb/ft³]'  : np.round(rho_step, 4),
+        'μg [cp]'      : np.round(mu_step, 6),
+        'cg [psi⁻¹]'   : [f"{v:.4e}" if not np.isnan(v) else "" for v in cg_step],
+    })
+
+    st.dataframe(df_gas, use_container_width=True, height=300, hide_index=True)
 
     csv_gas = pd.DataFrame({
-        'P_psia'        : gas_tbl['P'][valid_mask],
-        'Z'             : gas_tbl['Z'][valid_mask],
-        'Bg_ft3_per_scf': gas_tbl['Bg_ft3'][valid_mask],
-        'Bg_bbl_per_scf': gas_tbl['Bg_bbl'][valid_mask],
-        'rho_g_lb_ft3'  : gas_tbl['rho_g'][valid_mask],
-        'mu_g_cp'       : gas_tbl['mu_g'][valid_mask],
-        'cg_psi_inv'    : gas_tbl['cg'][valid_mask],
+        'P_psia'         : P_step,
+        'Z'              : Z_step,
+        'Bg_ft3_per_scf' : Bg_step,
+        'Bg_bbl_per_scf' : Bgb_step,
+        'rho_g_lb_ft3'   : rho_step,
+        'mu_g_cp'        : mu_step,
+        'cg_psi_inv'     : cg_step,
     })
     st.download_button(
         "Download gas PVT table as CSV",
         csv_gas.to_csv(index=False),
-        file_name=f"gas_pvt_SG{gas_SG_g:.3f}_T{T_g}F.csv",
+        file_name=f"gas_pvt_SG{gas_SG_g:.3f}_T{T}F.csv",
         mime="text/csv",
     )
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 3 — EOS
+# TAB 3 — PHASE BEHAVIOR
 # ════════════════════════════════════════════════════════════════════════════
 
 with tabs[2]:
-    st.subheader("Peng-Robinson EOS — Z-factor and Density")
+    st.subheader("Phase Behavior")
 
-    st.markdown(
-        '<div class="assumption-box">'
-        '<b>Limitations:</b> Uses bulk API/GOR/gas_SG to generate two '
-        'pseudo-components (gas C1-C6 via Sutton 1985; oil C7+ via '
-        'Katz-Firoozabadi 1978). C7+ critical pressure is adjusted so '
-        'b = 2.0 ft³/lbmol (Ahmed 2019). '
-        'Z-factors reflect the overall liquid-phase mixture. '
-        'Full two-phase flash requires real compositional data '
-        '(see Composition tab). '
-        'Bubble point shown is from Wilson K-values (internal helper for '
-        'pseudo-components only).'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+    ph_left, ph_right = st.columns(2)
 
-    fig_eos, _ = P.plot_eos_curves(
-        pseudo, T_F=T,
-        label=f'API={API} deg, GOR={GOR} scf/STB (pseudo-components)'
-    )
-    st.pyplot(fig_eos, use_container_width=True)
+    # ── Left: PT Phase Envelope ─────────────────────────────────────────────
+    with ph_left:
+        st.markdown("#### PT Phase Envelope")
 
-    st.divider()
-    st.subheader("Correlations vs EOS — Bubble Point")
-    fig_cmp, _ = P.plot_correlations_vs_eos(API, GOR, T, gas_SG, mixture=pseudo)
-    st.pyplot(fig_cmp, use_container_width=True)
+        # Determine composition to use
+        if _comp_valid and _mixture is not None:
+            _env_mixture    = _mixture
+            _env_mix_tuple  = _mix_tuple
+            _comp_label     = "Real composition (from mole fraction input)"
+        else:
+            _env_mixture    = pseudo
+            _pseudo_tuple   = tuple(
+                (pseudo['names'][i],
+                 float(pseudo['z'][i]),
+                 float(pseudo['Tc'][i]),
+                 float(pseudo['Pc'][i]),
+                 float(pseudo['omega'][i]),
+                 float(pseudo['MW'][i]))
+                for i in range(len(pseudo['names']))
+            )
+            _env_mix_tuple  = _pseudo_tuple
+            _comp_label     = f"Pseudo-components (API={API}°, GOR={GOR} scf/STB, gas SG={gas_SG:.3f})"
 
-    st.divider()
-    st.subheader("EOS Data Table")
-    tbl_eos = eos_table(pseudo, T_F=T)
-    df_eos  = pd.DataFrame({
-        'P [psia]'          : tbl_eos['P'].round(1),
-        'Z [-]'             : tbl_eos['Z'].round(4),
-        'Density [lb/ft³]'  : tbl_eos['rho'].round(3),
-        'V_mol [ft³/lbmol]' : tbl_eos['V_mol'].round(4),
-    })
-    st.dataframe(df_eos, use_container_width=True, height=300)
+        st.caption(f"Using: {_comp_label}")
+
+        with st.spinner("Building phase envelope..."):
+            env = compute_phase_envelope(_env_mix_tuple, T_range=(50.0, 400.0))
+
+        T_env   = env['T']
+        bub_mask = ~np.isnan(env['P_bubble'])
+        dew_mask = ~np.isnan(env['P_dew'])
+        Tc_mix_F = env['Tc_mix'] - 459.67
+
+        fig_env = go.Figure()
+        if bub_mask.any():
+            fig_env.add_trace(go.Scatter(
+                x=T_env[bub_mask], y=env['P_bubble'][bub_mask],
+                mode='lines+markers',
+                name='Bubble curve',
+                line=dict(color='#1565C0', width=2),
+                marker=dict(size=3),
+                hovertemplate='T = %{x:.1f} °F<br>P_bubble = %{y:,.0f} psia<extra></extra>',
+            ))
+        if dew_mask.any():
+            fig_env.add_trace(go.Scatter(
+                x=T_env[dew_mask], y=env['P_dew'][dew_mask],
+                mode='lines+markers',
+                name='Dew curve',
+                line=dict(color='#C62828', width=2, dash='dash'),
+                marker=dict(size=3),
+                hovertemplate='T = %{x:.1f} °F<br>P_dew = %{y:,.0f} psia<extra></extra>',
+            ))
+        fig_env.add_vline(
+            x=float(Tc_mix_F),
+            line_dash='dot', line_color='gray', line_width=1.2,
+            annotation_text=f"Tc mix (Kay's) = {Tc_mix_F:.1f} °F",
+            annotation_position='top right',
+            annotation_font_color='gray',
+            annotation_font_size=10,
+        )
+        fig_env.update_layout(
+            title=dict(
+                text='PT Phase Envelope (PR EOS, fugacity-based)',
+                font=dict(size=13),
+            ),
+            xaxis=dict(title='Temperature [°F]'),
+            yaxis=dict(title='Pressure [psia]', tickformat=',.0f'),
+            height=450,
+            margin=dict(l=60, r=30, t=60, b=50),
+            hovermode='closest',
+            legend=dict(x=0.02, y=0.98),
+        )
+        st.plotly_chart(fig_env, use_container_width=True)
+
+        n_bub = int(bub_mask.sum())
+        n_dew = int(dew_mask.sum())
+        n_T   = len(T_env)
+        st.caption(
+            f"Bubble: {n_bub}/{n_T} converged  |  Dew: {n_dew}/{n_T} converged  "
+            "|  T range: 50–400 °F (fixed)"
+        )
+
+    # ── Right: Binary Pxy Diagram ───────────────────────────────────────────
+    with ph_right:
+        st.markdown("#### Binary Pxy Diagram")
+
+        available_components = [c for c in PURE_COMPONENTS.index
+                                 if c not in ('C7+', 'C7PLUS')]
+
+        pxy_c1, pxy_c2 = st.columns(2)
+        with pxy_c1:
+            comp_A_sel = st.selectbox(
+                "Component A",
+                available_components,
+                index=available_components.index('C1') if 'C1' in available_components else 0,
+                key='pxy_compA',
+            )
+        with pxy_c2:
+            _b_options = [c for c in available_components if c != comp_A_sel]
+            comp_B_sel = st.selectbox(
+                "Component B",
+                _b_options,
+                index=0,
+                key='pxy_compB',
+            )
+
+        T_pxy = st.number_input(
+            "Temperature [°F]", -200.0, 400.0, 100.0, 5.0,
+            key='pxy_T',
+            help="Temperature for the Pxy diagram.",
+        )
+
+        if comp_A_sel == comp_B_sel:
+            st.warning("Component A and Component B must be different.")
+        else:
+            with st.spinner(f"Computing Pxy: {comp_A_sel}/{comp_B_sel} at T={T_pxy:.0f}°F..."):
+                pxy_result = compute_pxy(
+                    comp_A_sel, comp_B_sel, float(T_pxy),
+                    14.7, 5000.0, 50,
+                )
+
+            fig_pxy = _P.plot_pxy_plotly(pxy_result)
+            fig_pxy.update_layout(height=450)
+            st.plotly_chart(fig_pxy, use_container_width=True)
+
+            bub_conv = int(np.sum(~np.isnan(pxy_result['P_bubble'])))
+            dew_conv = int(np.sum(~np.isnan(pxy_result['P_dew'])))
+            st.caption(
+                f"Bubble: {bub_conv}/50 converged  |  "
+                f"Dew: {dew_conv}/50 converged  |  "
+                "P range: 14.7–5000 psia (fixed)."
+            )
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 4 — 3D SURFACES
+# TAB 4 — ABOUT
 # ════════════════════════════════════════════════════════════════════════════
 
 with tabs[3]:
-    st.subheader("Interactive 3D PVT Surfaces")
-    st.caption(
-        "Rotate: click and drag. Zoom: scroll. "
-        "Hover for exact values. All surfaces computed on a P-T grid."
-    )
-
-    surface_choice = st.radio(
-        "Select surface",
-        ["Bo(P,T) — Oil FVF",
-         "μo(P,T) — Viscosity",
-         "Z(P,T)  — EOS Compressibility",
-         "V(P,T)  — Molar Volume (P-V-T)"],
-        horizontal=True,
-    )
-
-    col_T, col_P = st.columns(2)
-    with col_T:
-        T_min_3d = st.slider("T min [°F]", 80,  200, 100, 10, key='tmin3d')
-        T_max_3d = st.slider("T max [°F]", 150, 350, 280, 10, key='tmax3d')
-    with col_P:
-        P_min_3d = st.slider("P min [psia]",  50,  500,  100, 50, key='pmin3d')
-        P_max_3d = st.slider("P max [psia]", 1000, 9000, 5000, 500, key='pmax3d')
-
-    T_range_3d = (float(T_min_3d), float(T_max_3d))
-    P_range_3d = (float(P_min_3d), float(P_max_3d))
-
-    with st.spinner("Computing surface..."):
-        if surface_choice.startswith("Bo"):
-            P_arr_g, T_arr_g, grid_g = _compute_bo_grid_cached(
-                API, GOR, gas_SG, T_range_3d, P_range_3d, region, 30, 40
-            )
-            region_label = REGIONS[region].split('—')[0].strip()
-            fig_3d = P.plot_3d_surface(
-                P_arr_g, T_arr_g, grid_g,
-                title=f'Oil FVF Bo(P,T) — {region_label}',
-                z_label='Bo [RB/STB]', colorscale='Blues',
-            )
-        elif surface_choice.startswith("μ"):
-            P_arr_g, T_arr_g, grid_g = _compute_visc_grid_cached(
-                API, GOR, gas_SG, T_range_3d, P_range_3d, region, 30, 40
-            )
-            region_label = REGIONS[region].split('—')[0].strip()
-            fig_3d = P.plot_3d_surface(
-                P_arr_g, T_arr_g, grid_g,
-                title=f'Oil Viscosity μo(P,T) — {region_label}',
-                z_label='μo [cp]', colorscale='Reds',
-            )
-        elif surface_choice.startswith("Z"):
-            P_arr_g, T_arr_g, grid_g = _compute_z_grid_cached(
-                API, GOR, gas_SG, T_range_3d, P_range_3d, 25, 35
-            )
-            fig_3d = P.plot_3d_surface(
-                P_arr_g, T_arr_g, grid_g,
-                title=f'Z-Factor(P,T) — PR EOS — API={API} deg',
-                z_label='Z [-]', colorscale='Plasma',
-            )
-        else:
-            P_arr_g, T_arr_g, grid_g = _compute_pvt_grid_cached(
-                API, GOR, gas_SG, T_range_3d, P_range_3d, 25, 35
-            )
-            fig_3d = P.plot_3d_surface(
-                P_arr_g, T_arr_g, grid_g,
-                title=f'P-V-T Surface (Molar Volume) — API={API} deg',
-                z_label='V [ft³/lbmol]', colorscale='Turbo',
-            )
-
-    st.plotly_chart(fig_3d, use_container_width=True)
-
-    st.markdown(
-        '<div class="assumption-box">'
-        'Bo and μ surfaces use empirical correlations (selected region). '
-        'Z and V surfaces use PR EOS with pseudo-components. '
-        'Temperatures outside the correlation development range yield NaN '
-        '(shown as gaps in the surface).'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 5 — PHASE
-# ════════════════════════════════════════════════════════════════════════════
-
-with tabs[4]:
-    st.subheader("PT Phase Envelope")
-
-    st.markdown(
-        '<div class="source-box">'
-        'Bubble and dew curves computed with PR EOS fugacity equality iteration '
-        '(Peng & Robinson 1976 Eq. 18). Wilson K-values (Wilson 1969) used '
-        'only as internal initialization; final results are fugacity-converged. '
-        'Non-converged points are shown as gaps in the envelope. '
-        'Source: Whitson & Brule (2000) SPE Monograph Vol.20, Section 3.3.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    T_env_min = st.slider("T range min [°F]", 50, 150, 80,  key='envmin')
-    T_env_max = st.slider("T range max [°F]", 200, 500, 380, key='envmax')
-
-    with st.spinner("Building phase envelope (fugacity iterations)..."):
-        fig_env, _ = P.plot_phase_envelope(
-            pseudo,
-            T_range=(float(T_env_min), float(T_env_max)),
-            label=f'API={API} deg, GOR={GOR} (pseudo-components)'
-        )
-    st.pyplot(fig_env, use_container_width=True)
-
-    st.markdown(
-        '<div class="assumption-box">'
-        '<b>Limitations:</b> Two pseudo-components (gas + C7+) yield extreme '
-        'Tc/Pc asymmetry. The phase envelope for real fluids should use '
-        '6-12 components with calibrated binary interaction parameters (kij). '
-        'For higher accuracy, provide real composition in the Composition tab.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 6 — Pxy DIAGRAM
-# ════════════════════════════════════════════════════════════════════════════
-
-with tabs[5]:
-    st.subheader("Binary Pxy Diagram")
-
-    st.markdown(
-        '<div class="source-box">'
-        'PR EOS fugacity equality (Peng-Robinson 1976). Bubble and dew curves '
-        'computed by solving fugacity equality at each feed composition.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    available_components = [c for c in PURE_COMPONENTS.index
-                             if c not in ('C7+', 'C7PLUS')]
-
-    pxy_col1, pxy_col2 = st.columns(2)
-    with pxy_col1:
-        comp_A_sel = st.selectbox(
-            "Component A",
-            available_components,
-            index=available_components.index('C1') if 'C1' in available_components else 0,
-            key='pxy_compA',
-        )
-    with pxy_col2:
-        comp_B_sel = st.selectbox(
-            "Component B",
-            [c for c in available_components if c != comp_A_sel],
-            index=0,
-            key='pxy_compB',
-        )
-
-    T_pxy = st.slider(
-        "Temperature [°F]", -200, 400, 50, 5, key='pxy_T',
-        help="Temperature for the Pxy diagram."
-    )
-
-    pxy_p_col1, pxy_p_col2 = st.columns(2)
-    with pxy_p_col1:
-        P_pxy_lo = st.number_input("P range low [psia]",  1.0, 500.0,  14.7, 1.0, key='pxy_plo')
-    with pxy_p_col2:
-        P_pxy_hi = st.number_input("P range high [psia]", 100.0, 15000.0, 5000.0, 50.0, key='pxy_phi')
-
-    n_pxy = st.slider("Number of composition steps", 20, 100, 50, 5, key='pxy_n')
-
-    if comp_A_sel == comp_B_sel:
-        st.warning("Component A and Component B must be different.")
-    elif P_pxy_lo >= P_pxy_hi:
-        st.warning("P range low must be less than P range high.")
-    else:
-        with st.spinner(f"Computing Pxy diagram for {comp_A_sel}/{comp_B_sel} at T={T_pxy} °F..."):
-            pxy_result = compute_pxy(
-                comp_A_sel, comp_B_sel, float(T_pxy),
-                float(P_pxy_lo), float(P_pxy_hi), int(n_pxy)
-            )
-
-        fig_pxy = P.plot_pxy_plotly(pxy_result)
-        st.plotly_chart(fig_pxy, use_container_width=True)
-
-        bub_conv = int(np.sum(~np.isnan(pxy_result['P_bubble'])))
-        dew_conv = int(np.sum(~np.isnan(pxy_result['P_dew'])))
-        st.caption(
-            f"Bubble curve: {bub_conv}/{n_pxy} points converged.  "
-            f"Dew curve: {dew_conv}/{n_pxy} points converged.  "
-            "Non-converged points appear as gaps."
-        )
-
-        st.markdown(
-            '<div class="assumption-box">'
-            'Binary interaction parameters kij = 0 (ideal mixing). '
-            'This is acceptable for hydrocarbon-hydrocarbon pairs but introduces '
-            'error for CO2/H2S-containing systems. '
-            'Wilson K-values are used only as initial guess for the fugacity iteration '
-            '— final bubble/dew pressures are fugacity-converged.'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 7 — COMPOSITION
-# ════════════════════════════════════════════════════════════════════════════
-
-with tabs[6]:
-    st.subheader("Real Fluid Composition Input")
-    st.markdown(
-        "Enter mole fractions from a lab PVT compositional report. "
-        "C7+ is always a lumped fraction and requires measured MW and SG. "
-        "Results update automatically on every input change."
-    )
-
-    st.markdown(
-        '<div class="source-box">'
-        'Pure component Tc, Pc, ω from '
-        '<b>data/pure_components.csv</b> — sourced from Ahmed (2019) '
-        'Table 1-1 and Peng & Robinson (1976) Table 1. '
-        'No values were estimated or assumed.'
-        '</div>',
-        unsafe_allow_html=True,
-    )
-
-    comp_cols = st.columns(3)
-    comp_inputs = {}
-    components_available = [c for c in PURE_COMPONENTS.index]
-
-    default_comp = {
-        'C1': 0.45, 'C2': 0.05, 'C3': 0.05,
-        'nC4': 0.03, 'nC5': 0.01, 'nC6': 0.01,
-    }
-
-    with comp_cols[0]:
-        st.markdown("**Hydrocarbon components**")
-        for comp in ['C1', 'C2', 'C3', 'nC4', 'iC4', 'nC5', 'iC5', 'nC6']:
-            val = default_comp.get(comp, 0.0)
-            comp_inputs[comp] = st.number_input(
-                f"{comp} (mol%)", 0.0, 100.0, val * 100, 0.1,
-                key=f'comp_{comp}'
-            ) / 100.0
-
-    with comp_cols[1]:
-        st.markdown("**Non-hydrocarbons**")
-        for comp in ['CO2', 'N2', 'H2S']:
-            comp_inputs[comp] = st.number_input(
-                f"{comp} (mol%)", 0.0, 100.0, 0.0, 0.1,
-                key=f'comp_{comp}'
-            ) / 100.0
-
-        st.markdown("**C7+ fraction**")
-        c7_frac = st.number_input("C7+ (mol%)", 0.0, 100.0, 40.0, 0.1) / 100.0
-        MW_c7   = st.number_input("C7+ MW [lb/lbmol]", 90.0, 600.0, 215.0, 1.0)
-        SG_c7   = st.number_input("C7+ SG [-]", 0.70, 1.10, 0.87, 0.01)
-
-    with comp_cols[2]:
-        st.markdown("**Composition summary**")
-        known_sum = sum(comp_inputs.values())
-        total_sum = known_sum + c7_frac
-
-        st.metric("Known components sum", f"{known_sum * 100:.2f} mol%")
-        st.metric("C7+ fraction",         f"{c7_frac  * 100:.2f} mol%")
-        st.metric("Total",                f"{total_sum * 100:.2f} mol%",
-                  delta=f"{(total_sum - 1.0) * 100:+.2f}%",
-                  delta_color="off" if abs(total_sum - 1.0) < 0.01 else "inverse")
-
-        if abs(total_sum - 1.0) > 0.01:
-            st.warning(
-                f"Mole fractions sum to {total_sum*100:.2f}%. "
-                "Must sum to 100% to run EOS."
-            )
-
-    # Auto-update when composition is valid (no button guard)
-    if abs(total_sum - 1.0) <= 0.01:
-        comp_dict = {k: v for k, v in comp_inputs.items() if v > 1e-6}
-        if c7_frac > 1e-6:
-            comp_dict['C7+'] = c7_frac
-
-        # Normalize
-        total = sum(comp_dict.values())
-        comp_dict_norm = {k: v / total for k, v in comp_dict.items()}
-
-        c7_props = characterize_c7plus(MW_c7, SG_c7)
-        mixture  = build_mixture(comp_dict_norm, c7plus_props=c7_props)
-
-        st.success("Mixture built from composition. EOS results below.")
-
-        # Component table
-        mix_df = pd.DataFrame({
-            'Component': mixture['names'],
-            'z [-]'    : np.round(mixture['z'], 5),
-            'Tc [°R]': np.round(mixture['Tc'], 1),
-            'Pc [psia]': np.round(mixture['Pc'], 1),
-            'ω [-]'    : np.round(mixture['omega'], 4),
-            'MW'       : np.round(mixture['MW'], 3),
-        })
-        st.dataframe(mix_df, use_container_width=True, hide_index=True)
-
-        # Bubble point via fugacity
-        from eos import pr_bubble_point_fugacity
-        Pb_fug, conv_bub, wb = pr_bubble_point_fugacity(mixture, T)
-        if conv_bub:
-            st.metric("EOS Bubble Point (PR Fugacity)", f"{Pb_fug:.1f} psia")
-        else:
-            st.metric("EOS Bubble Point (PR Fugacity)", "Not converged")
-        for w in wb:
-            st.warning(w)
-
-        # Flash result at a user-chosen pressure
-        st.divider()
-        st.markdown("**Flash Calculation**")
-        P_flash = st.slider("Flash pressure [psia]", 100, 8000, 1500, 50,
-                            key='p_flash_comp')
-        with st.spinner("Running flash..."):
-            flash_res = pr_flash(mixture, P_flash, T)
-
-        for w in flash_res['warnings']:
-            st.warning(w)
-
-        fig_flash, _ = P.plot_flash_result(flash_res, mixture, P_flash, T)
-        st.pyplot(fig_flash, use_container_width=True)
-
-        # Phase envelope
-        st.divider()
-        T_env_c_min = st.slider("Phase envelope T min [°F]", 50, 150, 80,  key='envmin_comp')
-        T_env_c_max = st.slider("Phase envelope T max [°F]", 200, 500, 380, key='envmax_comp')
-        with st.spinner("Building phase envelope..."):
-            fig_env_real, _ = P.plot_phase_envelope(
-                mixture,
-                T_range=(float(T_env_c_min), float(T_env_c_max)),
-                label='Real composition'
-            )
-        st.pyplot(fig_env_real, use_container_width=True)
-
-        # EOS curves
-        fig_eos_real, _ = P.plot_eos_curves(mixture, T_F=T, label='Real composition')
-        st.pyplot(fig_eos_real, use_container_width=True)
-
-        st.markdown(
-            '<div class="assumption-box">'
-            f'C7+ Tc={c7_props["Tc"]:.1f} °R, Pc={c7_props["Pc"]:.1f} psia '
-            f'from Katz-Firoozabadi (1978) table at MW={MW_c7:.0f}. '
-            f'Pc adjusted so PR b = 2.0 ft³/lbmol. '
-            f'Source: {c7_props["source"]}'
-            '</div>',
-            unsafe_allow_html=True,
-        )
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# TAB 8 — ABOUT
-# ════════════════════════════════════════════════════════════════════════════
-
-with tabs[7]:
     st.subheader("Methodology and References")
 
     st.markdown("""
@@ -934,14 +840,12 @@ Defined only above bubble point (P >= Pb). Below Pb, co is shown as "< Pb".
 - **Gas condensate**: Standing (1977) 9th ed. SPE, p. 204
 - **Acid-gas correction**: Wichert & Aziz (1972) *Hydrocarbon Processing*, May 1972, pp. 119-122
 
-#### Z-Factor Methods
-- **Hall-Yarborough (1974)** SPE-3350-PA — primary method
+#### Z-Factor Method
+- **Hall-Yarborough (1974)** SPE-3350-PA — the only method used
   - Newton-Raphson on Starling-Carnahan EOS; valid Tpr >= 1.05
   - Convergence: |Δy/y| < 1×10⁻¹⁰; max 200 iterations
   - Returns NaN with warning if Tpr < 1.05 (correlation undefined)
-- **DPR (1974)** — Dranchuk, Purvis & Robinson; BWR-type, 8 constants
-  - Stated validity: 1.05 <= Tpr <= 3.0, 0 < Ppr <= 3.0
-  - Outside range: result flagged as extrapolation
+  - DPR (Dranchuk-Purvis-Robinson 1974) is used only internally as a cross-check
 
 #### Gas Viscosity
 - **Lee, Gonzalez & Eakin (1966)** SPE-1340-PA
