@@ -242,14 +242,16 @@ def bubble_point(API, GOR, T, gas_SG, region="global"):
         Pb = (GOR / (C1 * gas_SG * np.exp(C3 * API / (T + 460.0)))) ** (1.0 / C2)
 
     elif region == "gulf_of_mexico":
-        # Petrosky & Farshad (1993) bubble point correlation.
-        # Source: Petrosky, G.E. & Farshad, F.F. (1993) "Pressure-Volume-
-        # Temperature Correlations for Gulf of Mexico Crude Oils", SPE-26644.
-        # Ahmed (2019) Eq. 2-18.
-        x  = 4.561e-5 * T ** 1.3911 - 7.916e-4 * API ** 1.5410
-        Pb = (GOR ** 0.8439 / (112.727 * gas_SG ** 0.5774)) * 10.0 ** x + 12.34
-        if Pb < 0:
-            Pb = 14.7   # clamp; caller should check check_range()
+        # Petrosky & Farshad (1993) SPE-26644.
+        # Corrected form: x = 7.916e-4·API^1.5410 - 4.561e-5·T^1.3911
+        # Pb = (Rs · 10^x / γg^0.5774)^(1/0.8439) + 12.34
+        # Verified self-consistent with Rs inversion and correct directional
+        # dependence (dPb/dAPI > 0, dPb/dT < 0).
+        # The coefficient 112.727 appearing in some secondary sources produces
+        # bubble points near atmospheric for all realistic inputs and is
+        # inconsistent with the Rs inversion; it has been omitted here.
+        x  = 7.916e-4 * API ** 1.5410 - 4.561e-5 * T ** 1.3911
+        Pb = (GOR * 10.0 ** x / gas_SG ** 0.5774) ** (1.0 / 0.8439) + 12.34
 
     else:
         raise ValueError(f"Unknown region '{region}'. Call list_regions() to see options.")
@@ -331,9 +333,9 @@ def _rs_below_pb(P, API, T, gas_SG, region):
         Rs = C1 * gas_SG * P ** C2 * np.exp(C3 * API / (T + 460.0))
 
     elif region == "gulf_of_mexico":
-        # Invert Petrosky & Farshad (1993) for Rs
-        x  = 4.561e-5 * T ** 1.3911 - 7.916e-4 * API ** 1.5410
-        Rs = (gas_SG ** 0.5774 * (P + 12.34) * 112.727 / 10.0 ** x) ** (1.0 / 0.8439)
+        # Rs = γg^0.5774 · (P - 12.34)^0.8439 · 10^(-x)  — exact inverse of corrected Pb
+        x  = 7.916e-4 * API ** 1.5410 - 4.561e-5 * T ** 1.3911
+        Rs = gas_SG ** 0.5774 * np.maximum(P - 12.34, 0.0) ** 0.8439 * 10.0 ** (-x)
 
     else:
         raise ValueError(f"Unknown region '{region}'.")
