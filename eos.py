@@ -873,9 +873,41 @@ def pr_bubble_point_fugacity(mixture, T_F, P_lo=14.7, P_hi=10000.0,
         warnings_out.append("Bubble point: Wilson bracket solve failed.")
         return float('nan'), False, warnings_out
 
-    # Refine with fugacity successive substitution
-    P_cur = P_wilson
-    K     = _wilson_K(Tc, Pc, omega, T_R, P_cur)
+    # --- Choose a starting pressure inside the two-phase region ---------------
+    # The Wilson estimate may land in a single-phase pressure region where the
+    # PR cubic has only one real root (Z_liq ≈ Z_vap). Successive substitution
+    # there collapses to the trivial K≈1 solution (the spinodal/critical point)
+    # rather than the true binodal bubble point. If that happens, restart just
+    # below the spinodal bubble pressure, i.e. inside the two-phase band, and
+    # let the iteration converge outward to the (higher) binodal.
+    a_p, b_p          = pr_parameters(Tc, Pc, omega, T_F)
+    a_mix, b_mix, _   = pr_mix(a_p, b_p, z, kij)
+    Z_liq_w, Z_vap_w  = pr_z_factor(P_wilson, T_F, a_mix, b_mix)
+    has_two_roots = (Z_liq_w is not None) and (abs(Z_liq_w - Z_vap_w) > 0.05)
+
+    if has_two_roots:
+        P_start = P_wilson
+    else:
+        _, P_spin_bub = _find_two_phase_pressure_range(
+            z, Tc, Pc, omega, T_F, P_lo=min(P_lo, 1.0), P_hi=P_hi, kij=kij
+        )
+        if np.isnan(P_spin_bub):
+            warnings_out.append(
+                "Bubble point: no two-phase region found (above cricondenbar/"
+                "cricondentherm?)."
+            )
+            return float('nan'), False, warnings_out
+        # Start just inside the two-phase band, below the spinodal bubble edge.
+        P_start = P_spin_bub * 0.95
+
+    # --- Successive substitution on K, multiplicative update on P ------------
+    # At fixed K, S = Σ Ki*zi decreases as P rises (Ki ∝ 1/P), so P_new = P*S
+    # drives S → 1. The update is unclamped (fast convergence for heavy
+    # mixtures whose bubble point is far from the Wilson estimate); the
+    # near-critical guard terminates the search before the liquid/vapor roots
+    # merge into the trivial K≈1 solution.
+    P_cur     = P_start
+    K         = _wilson_K(Tc, Pc, omega, T_R, P_cur)
     converged = False
 
     for it in range(max_iter):
@@ -883,7 +915,6 @@ def pr_bubble_point_fugacity(mixture, T_F, P_lo=14.7, P_hi=10000.0,
         S     = y_raw.sum()
         y     = y_raw / S
 
-        # Update K-values from fugacity
         ln_phi_L, _ = _pr_fugacity_coeffs_root(P_cur, T_F, z, Tc, Pc, omega, kij, phase='liq')
         ln_phi_V, _ = _pr_fugacity_coeffs_root(P_cur, T_F, y, Tc, Pc, omega, kij, phase='vap')
 
@@ -892,16 +923,12 @@ def pr_bubble_point_fugacity(mixture, T_F, P_lo=14.7, P_hi=10000.0,
             break
 
         K_new = np.exp(ln_phi_L - ln_phi_V)
+        S_new = float(np.sum(K_new * z))
 
-        # Update pressure to satisfy Σyi = 1
-        S_new = np.sum(K_new * z)
-        # Simple update: multiply P by S_new to drive Σy→1
-        P_cur = P_cur * S_new
+        # Multiply P by S to drive Σy → 1; bound to the search range.
+        P_cur = float(np.clip(P_cur * S_new, P_lo, P_hi * 2.0))
 
-        # Clamp P to search range
-        P_cur = max(P_lo, min(P_cur, P_hi * 2.0))
-
-        K_err = np.sum((np.log(K_new + 1e-300) - np.log(K + 1e-300)) ** 2)
+        K_err = float(np.sum((np.log(K_new + 1e-300) - np.log(K + 1e-300)) ** 2))
         K     = K_new
 
         if K_err < tol and abs(S_new - 1.0) < tol:
@@ -913,18 +940,31 @@ def pr_bubble_point_fugacity(mixture, T_F, P_lo=14.7, P_hi=10000.0,
             f"Bubble point fugacity iteration did not converge in {max_iter} steps "
             f"(last P={P_cur:.1f} psia, Σy={np.sum(K*z):.6f})."
         )
+        return float('nan'), False, warnings_out
+
+    # Michelsen (1982) non-trivial solution check: reject K_i ≈ 1 everywhere.
+    # A trivial solution (Σ(ln K)² → 0) means liquid and vapor became identical
+    # (single cubic root → φ_L = φ_V), so the "converged" point is spurious.
+    if np.sum(np.log(np.maximum(K, 1e-300)) ** 2) < 1e-4:
+        warnings_out.append(
+            f"Bubble point: trivial solution (K≈1) at P={P_cur:.1f} psia rejected."
+        )
+        return float('nan'), False, warnings_out
 
     return float(P_cur), converged, warnings_out
 
 
-def pr_dew_point_fugacity(mixture, T_F, P_lo=14.7, P_hi=10000.0,
-                           kij=None, max_iter=100, tol=1e-6):
+def pr_dew_point_fugacity(mixture, T_F, P_lo=14.7, P_hi=15000.0,
+                           kij=None, max_iter=300, tol=1e-8):
     """
     Dew point pressure from PR EOS fugacity equality.
 
     At dew point (vapor of composition z, infinitesimal liquid x):
         φi_V(z, P, T) * zi = φi_L(x, P, T) * xi   for all i
         Σ xi = 1
+
+    Uses damped successive substitution in log-space with step clamping
+    and oscillation detection.
 
     Source: Whitson & Brulé (2000) SPE Monograph Vol.20, Section 3.3.
 
@@ -941,67 +981,201 @@ def pr_dew_point_fugacity(mixture, T_F, P_lo=14.7, P_hi=10000.0,
     T_R   = T_F + F_TO_R
     warnings_out = []
 
-    def sum_x(P_val):
-        """Σ xi = Σ zi/Ki (Wilson initialization)."""
+    def sum_x_wilson(P_val):
         K = _wilson_K(Tc, Pc, omega, T_R, P_val)
         return float(np.sum(z / np.maximum(K, 1e-30)))
 
-    # Bracket
+    # --- Wilson bracket (try extended range if needed) ---
     try:
-        fa = sum_x(P_lo) - 1.0
-        fb = sum_x(P_hi) - 1.0
+        fa = sum_x_wilson(P_lo) - 1.0
+        fb = sum_x_wilson(P_hi) - 1.0
     except Exception:
         warnings_out.append("Dew point: could not evaluate Wilson K at bounds.")
         return float('nan'), False, warnings_out
 
     if fa * fb > 0:
-        warnings_out.append(
-            f"Dew point not bracketed in [{P_lo:.1f}, {P_hi:.1f}] psia. "
-            "Returning NaN."
-        )
-        return float('nan'), False, warnings_out
+        for P_ext in [20000.0, 30000.0, 50000.0]:
+            try:
+                fb_ext = sum_x_wilson(P_ext) - 1.0
+            except Exception:
+                break
+            if fa * fb_ext <= 0:
+                P_hi = P_ext
+                fb = fb_ext
+                break
+        if fa * fb > 0:
+            warnings_out.append(
+                f"Dew point not bracketed in [{P_lo:.1f}, {P_hi:.1f}] psia."
+            )
+            return float('nan'), False, warnings_out
 
     try:
-        P_wilson = brentq(lambda P: sum_x(P) - 1.0, P_lo, P_hi, xtol=1.0, maxiter=100)
+        P_wilson = brentq(lambda P: sum_x_wilson(P) - 1.0, P_lo, P_hi,
+                          xtol=1.0, maxiter=200)
     except (ValueError, RuntimeError):
         warnings_out.append("Dew point: Wilson bracket solve failed.")
         return float('nan'), False, warnings_out
 
-    P_cur = P_wilson
-    K     = _wilson_K(Tc, Pc, omega, T_R, P_cur)
-    converged = False
+    # --- Quick feasibility check: does S_fug ever reach 1? ---
+    # Wilson K-values can give a false bracket above the cricondentherm.
+    # Sample S_fug at a few pressures; if max < 1, no real dew point exists.
+    def _sfug(P_val, K_init=None):
+        K_s = K_init if K_init is not None else _wilson_K(Tc, Pc, omega, T_R, P_val)
+        x_s = z / np.maximum(K_s, 1e-30)
+        x_s = x_s / max(x_s.sum(), 1e-30)
+        lL, _ = _pr_fugacity_coeffs_root(P_val, T_F, x_s, Tc, Pc, omega, kij, phase='liq')
+        lV, _ = _pr_fugacity_coeffs_root(P_val, T_F, z,   Tc, Pc, omega, kij, phase='vap')
+        if np.any(np.isnan(lL)) or np.any(np.isnan(lV)):
+            return None
+        return float(np.sum(z / np.maximum(np.exp(lL - lV), 1e-30)))
+
+    scan_pressures = np.geomspace(max(P_wilson, P_lo), min(P_hi, 15000.0), 8)
+    sfug_vals = [v for v in (_sfug(Ps) for Ps in scan_pressures) if v is not None]
+    if sfug_vals and max(sfug_vals) < 0.99:
+        warnings_out.append(
+            f"Dew point: S_fug max={max(sfug_vals):.3f} < 1 in scan — "
+            "no two-phase region at this T (above cricondentherm?)."
+        )
+        return float('nan'), False, warnings_out
+
+    # If S_fug crosses 1, use the crossing pressure as a better starting point
+    for k in range(len(sfug_vals) - 1):
+        if sfug_vals[k] < 1.0 <= sfug_vals[k + 1] or sfug_vals[k] >= 1.0 > sfug_vals[k + 1]:
+            P_wilson = float(scan_pressures[k])
+            break
+
+    # --- Damped successive substitution ---
+    P_cur        = P_wilson
+    K            = _wilson_K(Tc, Pc, omega, T_R, P_cur)
+    ln_K         = np.log(np.maximum(K, 1e-30))
+    ln_K_fug_prev = ln_K.copy()   # fugacity-based K from previous iteration
+    converged    = False
+    prev_ln_S    = 0.0
+    damping      = 1.0   # start undamped; reduced if oscillation detected
 
     for it in range(max_iter):
         x_raw = z / np.maximum(K, 1e-30)
         S     = x_raw.sum()
-        x     = x_raw / S
+        x     = x_raw / max(S, 1e-30)
 
-        ln_phi_L, _ = _pr_fugacity_coeffs_root(P_cur, T_F, x, Tc, Pc, omega, kij, phase='liq')
-        ln_phi_V, _ = _pr_fugacity_coeffs_root(P_cur, T_F, z, Tc, Pc, omega, kij, phase='vap')
+        ln_phi_L, Z_L = _pr_fugacity_coeffs_root(P_cur, T_F, x, Tc, Pc, omega, kij, phase='liq')
+        ln_phi_V, Z_V = _pr_fugacity_coeffs_root(P_cur, T_F, z, Tc, Pc, omega, kij, phase='vap')
 
         if np.any(np.isnan(ln_phi_L)) or np.any(np.isnan(ln_phi_V)):
             warnings_out.append(f"Dew point: NaN fugacity at P={P_cur:.1f}, iter={it+1}.")
             break
 
-        K_new = np.exp(ln_phi_L - ln_phi_V)
-        S_new = np.sum(z / np.maximum(K_new, 1e-30))
-        P_cur = P_cur / S_new
-        P_cur = max(P_lo, min(P_cur, P_hi * 2.0))
+        # Near-critical: liquid and vapor roots merge — SS will not converge
+        if it > 3 and abs(Z_L - Z_V) < 0.02:
+            warnings_out.append(
+                f"Dew point: near-critical (Z_L≈Z_V={Z_L:.3f}) at P={P_cur:.1f} psia."
+            )
+            break
 
-        K_err = np.sum((np.log(K_new + 1e-300) - np.log(K + 1e-300)) ** 2)
-        K     = K_new
+        ln_K_new = ln_phi_L - ln_phi_V
+        K_new    = np.exp(ln_K_new)
+        S_new    = float(np.sum(z / np.maximum(K_new, 1e-30)))
+        ln_S_new = np.log(max(S_new, 1e-10))
+
+        # Oscillation detection: sign flip in ln_S → halve damping
+        if it > 0 and ln_S_new * prev_ln_S < -1e-4:
+            damping = max(damping * 0.5, 0.05)
+
+        # Clamp step to avoid huge pressure jumps (max factor ~e^0.4 ≈ 1.5 per step)
+        ln_P_step = -np.clip(damping * ln_S_new, -0.4, 0.4)
+        P_cur     = float(np.clip(P_cur * np.exp(ln_P_step), P_lo, P_hi * 3.0))
+
+        # K-value update with damping; K is what's used for x next iteration
+        ln_K  = (1.0 - damping) * ln_K + damping * ln_K_new
+        K     = np.exp(ln_K)
+
+        prev_ln_S = ln_S_new
+
+        # Convergence: check how much the fugacity-based K changed between iterations
+        # (not vs the damped K — that would never converge under heavy damping)
+        K_err = float(np.sum((ln_K_new - ln_K_fug_prev) ** 2))
+        ln_K_fug_prev = ln_K_new.copy()
 
         if K_err < tol and abs(S_new - 1.0) < tol:
             converged = True
             break
 
+        # Stall detection: heavy damping and S_new stuck far from 1 → no solution here
+        if it > 30 and damping < 0.1 and abs(S_new - 1.0) > 0.15:
+            warnings_out.append(
+                f"Dew point: stalled (damping={damping:.3f}, S={S_new:.3f}) at P={P_cur:.1f}."
+            )
+            break
+
     if not converged:
         warnings_out.append(
             f"Dew point fugacity iteration did not converge in {max_iter} steps "
-            f"(last P={P_cur:.1f} psia)."
+            f"(last P={P_cur:.1f} psia). Using Wilson fallback."
         )
+        return float(P_wilson), False, warnings_out
+
+    # Michelsen (1982) non-trivial solution check: reject K_i ≈ 1 everywhere.
+    if np.sum(np.log(np.maximum(K, 1e-300)) ** 2) < 1e-4:
+        warnings_out.append(
+            f"Dew point: trivial solution (K≈1) at P={P_cur:.1f} psia rejected."
+        )
+        return float('nan'), False, warnings_out
 
     return float(P_cur), converged, warnings_out
+
+
+# ---------------------------------------------------------------------------
+# PR TWO-PHASE PRESSURE RANGE — CUBIC ROOT STRUCTURE
+# ---------------------------------------------------------------------------
+
+def _cubic_root_gap(z, Tc, Pc, omega, T_F, P, kij=None):
+    """|Z_vap - Z_liq| from the PR cubic at composition z. >0 means three real
+    roots (single phase mechanically unstable -> inside the two-phase region)."""
+    a, b = pr_parameters(Tc, Pc, omega, T_F)
+    a_mix, b_mix, _ = pr_mix(a, b, z, kij)
+    Z_liq, Z_vap = pr_z_factor(P, T_F, a_mix, b_mix)
+    if Z_liq is None:
+        return 0.0
+    return abs(Z_vap - Z_liq)
+
+
+def _find_two_phase_pressure_range(z, Tc, Pc, omega, T_F,
+                                   P_lo=1.0, P_hi=15000.0, n_scan=200,
+                                   gap_thresh=0.05, kij=None):
+    """Scan P for the band where the PR cubic has three real roots.
+
+    Returns (P_dew, P_bubble) = low-P and high-P edges of that band, or
+    (nan, nan) if none. Robust for any composition (root-finding only, no
+    successive-substitution convergence issues). Note: this is the mechanical
+    spinodal of composition z, which lies inside the true binodal saturation
+    curve, so pressures are conservative (under-predicted) versus a rigorous
+    flash — it is used because it reliably yields a closed envelope.
+    """
+    pressures = np.geomspace(P_lo, P_hi, n_scan)
+    gap = np.array([
+        _cubic_root_gap(z, Tc, Pc, omega, T_F, P, kij) for P in pressures
+    ])
+    mask = gap > gap_thresh
+    if not mask.any():
+        return float('nan'), float('nan')
+
+    idx = np.where(mask)[0]
+    lo_i, hi_i = int(idx[0]), int(idx[-1])
+
+    def _refine(i_out, i_in):
+        p_out, p_in = pressures[i_out], pressures[i_in]
+        for _ in range(40):
+            p_mid = np.sqrt(p_out * p_in)
+            if _cubic_root_gap(z, Tc, Pc, omega, T_F, p_mid, kij) > gap_thresh:
+                p_in = p_mid
+            else:
+                p_out = p_mid
+        return float(p_in)
+
+    P_dew = float(pressures[lo_i]) if lo_i == 0 else _refine(lo_i - 1, lo_i)
+    P_bub = (float(pressures[hi_i]) if hi_i == len(pressures) - 1
+             else _refine(hi_i + 1, hi_i))
+    return P_dew, P_bub
 
 
 # ---------------------------------------------------------------------------
@@ -1041,21 +1215,29 @@ def pr_phase_envelope(mixture, T_range=(50.0, 400.0), n_T=60,
     dew_conv = np.zeros(n_T, dtype=bool)
     all_warnings = []
 
+    # Dew points can sit well below atmospheric for heavy/oil-rich mixtures,
+    # so allow the dew solver to bracket down to near-vacuum.
+    P_lo_dew = min(P_lo, 1.0)
+
     for i, T_F in enumerate(T_arr):
+        # Binodal (true saturation curve) from fugacity equality. The bubble
+        # branch (liquid z, incipient vapor) gives the upper curve; the dew
+        # branch (vapor z, incipient liquid) gives the lower curve. Both use
+        # successive substitution with non-trivial-solution rejection, so the
+        # result is the thermodynamic phase boundary — NOT the (lower-pressure)
+        # mechanical spinodal of the cubic root structure.
         Pb, cb, wb = pr_bubble_point_fugacity(
-            mixture, T_F, P_lo=P_lo, P_hi=P_hi, kij=kij
+            mixture, float(T_F), P_lo=P_lo, P_hi=P_hi, kij=kij
         )
-        P_bub[i]    = Pb if cb and not np.isnan(Pb) else np.nan
-        bub_conv[i] = cb
-
         Pd, cd, wd = pr_dew_point_fugacity(
-            mixture, T_F, P_lo=P_lo, P_hi=P_hi, kij=kij
+            mixture, float(T_F), P_lo=P_lo_dew, P_hi=P_hi, kij=kij
         )
-        P_dew[i]    = Pd if cd and not np.isnan(Pd) else np.nan
-        dew_conv[i] = cd
-
-        all_warnings.extend(wb)
-        all_warnings.extend(wd)
+        if cb and not np.isnan(Pb):
+            P_bub[i]    = Pb
+            bub_conv[i] = True
+        if cd and not np.isnan(Pd):
+            P_dew[i]    = Pd
+            dew_conv[i] = True
 
     return {
         'T'        : T_arr,
@@ -1067,6 +1249,48 @@ def pr_phase_envelope(mixture, T_range=(50.0, 400.0), n_T=60,
         'dew_conv' : dew_conv,
         'warnings' : all_warnings,
     }
+
+
+# ---------------------------------------------------------------------------
+# AUTO-DETECT ENVELOPE TEMPERATURE RANGE
+# ---------------------------------------------------------------------------
+
+def find_envelope_T_range(mixture, T_lo_search=-150.0, T_hi_search=800.0,
+                           n_coarse=18, kij=None):
+    """
+    Scan a wide temperature range to find where the two-phase envelope exists,
+    then return (T_lo, T_hi) with margin suitable for a detailed calculation.
+
+    Uses a coarse pass of pr_phase_envelope so results inherit the improved
+    fugacity-based dew/bubble convergence (no false Wilson positives).
+
+    Returns
+    -------
+    T_lo, T_hi : float [°F]   padded bounds of the two-phase region
+    found      : bool          False if no two-phase region detected at all
+    """
+    env = pr_phase_envelope(mixture, T_range=(T_lo_search, T_hi_search),
+                             n_T=n_coarse, kij=kij)
+    T = env['T']
+
+    has_bub = ~np.isnan(env['P_bubble']) & env['bub_conv']
+    has_dew = ~np.isnan(env['P_dew'])    & env['dew_conv']
+    has_any = has_bub | has_dew
+
+    if not has_any.any():
+        return T_lo_search, T_hi_search, False
+
+    T_found = T[has_any]
+    T_lo_raw = float(T_found.min())
+    T_hi_raw = float(T_found.max())
+    span     = max(T_hi_raw - T_lo_raw, 20.0)
+
+    # Pad by 15% each side so the closed tip of the envelope is visible
+    pad   = 0.15 * span
+    T_lo  = max(T_lo_raw - pad, T_lo_search)
+    T_hi  = min(T_hi_raw + pad, T_hi_search)
+
+    return T_lo, T_hi, True
 
 
 # ---------------------------------------------------------------------------
@@ -1196,7 +1420,11 @@ def pxy_diagram_fugacity(comp_A, comp_B, T_F, P_range=(14.7, 5000.0), n_x=60):
 
     For each feed composition z_A from 0 to 1, finds bubble point pressure
     (Sigma Ki*zi = 1, x=z) and dew point pressure (Sigma zi/Ki = 1, y=z) using
-    full PR fugacity iteration.
+    full PR fugacity iteration.  When EOS iteration does not converge, falls back
+    to the Wilson K-value estimate (flagged via bub_conv/dew_conv = False).
+
+    The upper pressure search bound is auto-scaled from Wilson bubble estimates
+    so that highly volatile pairs (e.g. C1/iC4) are not artificially capped.
 
     Source: Peng & Robinson (1976); Michelsen & Mollerup (2007) Thermodynamic
             Models: Fundamentals & Computational Aspects, Ch. 5.
@@ -1213,36 +1441,53 @@ def pxy_diagram_fugacity(comp_A, comp_B, T_F, P_range=(14.7, 5000.0), n_x=60):
     -------
     dict with keys:
         'x_A'      : array — feed mole fraction of A (0 to 1)
-        'P_bubble' : array — bubble point pressures [psia]  (NaN if not converged)
-        'P_dew'    : array — dew point pressures [psia]     (NaN if not converged)
+        'P_bubble' : array — bubble point pressures [psia]  (NaN if not in two-phase region)
+        'P_dew'    : array — dew point pressures [psia]     (NaN if not in two-phase region)
+        'bub_conv' : array [bool] — True = EOS converged, False = Wilson fallback
+        'dew_conv' : array [bool]
         'comp_A'   : str
         'comp_B'   : str
         'T_F'      : float
     """
+    P_lo    = P_range[0]
+    P_hi    = P_range[1]
+    T_R     = T_F + F_TO_R
     x_A_arr = np.linspace(0.001, 0.999, n_x)
-    P_bub   = np.full(n_x, np.nan)
-    P_dew   = np.full(n_x, np.nan)
+
+    # Auto-scale P_hi: scan a few compositions, estimate Wilson bubble P,
+    # and extend the search range so volatile pairs are not artificially capped.
+    for probe_xA in [0.1, 0.3, 0.5, 0.7, 0.9]:
+        try:
+            mix_probe = build_mixture({comp_A: probe_xA, comp_B: 1.0 - probe_xA})
+            K_probe   = _wilson_K(mix_probe['Tc'], mix_probe['Pc'], mix_probe['omega'],
+                                  T_R, P_lo)
+            S_probe   = float(np.sum(mix_probe['z'] * K_probe))
+            P_hi = max(P_hi, P_lo * S_probe * 1.5)
+        except Exception:
+            pass
+    P_hi = min(P_hi, 30000.0)   # hard cap at 30 000 psia
+
+    P_bub    = np.full(n_x, np.nan)
+    P_dew    = np.full(n_x, np.nan)
+    bub_conv = np.zeros(n_x, dtype=bool)
+    dew_conv = np.zeros(n_x, dtype=bool)
 
     for i, x_A in enumerate(x_A_arr):
         comp_dict = {comp_A: float(x_A), comp_B: float(1.0 - x_A)}
-        # Bubble point
         try:
             mix = build_mixture(comp_dict)
-            Pb, cb, _ = pr_bubble_point_fugacity(
-                mix, T_F, P_lo=P_range[0], P_hi=P_range[1]
-            )
-            if cb and not np.isnan(Pb):
-                P_bub[i] = Pb
+            Pb, cb, _ = pr_bubble_point_fugacity(mix, T_F, P_lo=P_lo, P_hi=P_hi)
+            if not np.isnan(Pb):
+                P_bub[i]    = Pb
+                bub_conv[i] = cb
         except Exception:
             pass
-        # Dew point
         try:
             mix = build_mixture(comp_dict)
-            Pd, cd, _ = pr_dew_point_fugacity(
-                mix, T_F, P_lo=P_range[0], P_hi=P_range[1]
-            )
-            if cd and not np.isnan(Pd):
-                P_dew[i] = Pd
+            Pd, cd, _ = pr_dew_point_fugacity(mix, T_F, P_lo=P_lo, P_hi=P_hi)
+            if not np.isnan(Pd):
+                P_dew[i]    = Pd
+                dew_conv[i] = cd
         except Exception:
             pass
 
@@ -1250,6 +1495,8 @@ def pxy_diagram_fugacity(comp_A, comp_B, T_F, P_range=(14.7, 5000.0), n_x=60):
         'x_A'     : x_A_arr,
         'P_bubble': P_bub,
         'P_dew'   : P_dew,
+        'bub_conv': bub_conv,
+        'dew_conv': dew_conv,
         'comp_A'  : comp_A,
         'comp_B'  : comp_B,
         'T_F'     : T_F,

@@ -771,23 +771,27 @@ def plot_pxy_plotly(pxy_dict):
     -------
     plotly Figure
     """
-    x_A   = pxy_dict['x_A']
-    P_bub = pxy_dict['P_bubble']
-    P_dew = pxy_dict['P_dew']
-    cA    = pxy_dict['comp_A']
-    cB    = pxy_dict['comp_B']
-    T_F   = pxy_dict['T_F']
+    x_A      = pxy_dict['x_A']
+    P_bub    = pxy_dict['P_bubble']
+    P_dew    = pxy_dict['P_dew']
+    bub_conv = pxy_dict.get('bub_conv', np.ones(len(x_A), dtype=bool))
+    dew_conv = pxy_dict.get('dew_conv', np.ones(len(x_A), dtype=bool))
+    cA       = pxy_dict['comp_A']
+    cB       = pxy_dict['comp_B']
+    T_F      = pxy_dict['T_F']
+
+    bub_eos = ~np.isnan(P_bub) &  bub_conv
+    bub_wil = ~np.isnan(P_bub) & ~bub_conv
+    dew_eos = ~np.isnan(P_dew) &  dew_conv
+    dew_wil = ~np.isnan(P_dew) & ~dew_conv
 
     fig = go.Figure()
 
-    bub_mask = ~np.isnan(P_bub)
-    dew_mask = ~np.isnan(P_dew)
-
-    if bub_mask.any():
+    if bub_eos.any():
         fig.add_trace(go.Scatter(
-            x=x_A[bub_mask], y=P_bub[bub_mask],
+            x=x_A[bub_eos], y=P_bub[bub_eos],
             mode='lines+markers',
-            name='Bubble curve',
+            name='Bubble (EOS)',
             line=dict(color='#1565C0', width=2),
             marker=dict(size=4),
             hovertemplate=(
@@ -795,17 +799,40 @@ def plot_pxy_plotly(pxy_dict):
                 f'Bubble P = %{{y:,.1f}} psia<extra></extra>'
             ),
         ))
-
-    if dew_mask.any():
+    if bub_wil.any():
         fig.add_trace(go.Scatter(
-            x=x_A[dew_mask], y=P_dew[dew_mask],
+            x=x_A[bub_wil], y=P_bub[bub_wil],
             mode='lines+markers',
-            name='Dew curve',
+            name='Bubble (Wilson approx)',
+            line=dict(color='#90CAF9', width=1.5, dash='dot'),
+            marker=dict(size=4),
+            hovertemplate=(
+                f'z({cA}) = %{{x:.3f}}<br>'
+                f'Bubble P ≈ %{{y:,.1f}} psia (Wilson)<extra></extra>'
+            ),
+        ))
+    if dew_eos.any():
+        fig.add_trace(go.Scatter(
+            x=x_A[dew_eos], y=P_dew[dew_eos],
+            mode='lines+markers',
+            name='Dew (EOS)',
             line=dict(color='#C62828', width=2, dash='dash'),
             marker=dict(size=4),
             hovertemplate=(
                 f'z({cA}) = %{{x:.3f}}<br>'
                 f'Dew P = %{{y:,.1f}} psia<extra></extra>'
+            ),
+        ))
+    if dew_wil.any():
+        fig.add_trace(go.Scatter(
+            x=x_A[dew_wil], y=P_dew[dew_wil],
+            mode='lines+markers',
+            name='Dew (Wilson approx)',
+            line=dict(color='#EF9A9A', width=1.5, dash='dot'),
+            marker=dict(size=4),
+            hovertemplate=(
+                f'z({cA}) = %{{x:.3f}}<br>'
+                f'Dew P ≈ %{{y:,.1f}} psia (Wilson)<extra></extra>'
             ),
         ))
 

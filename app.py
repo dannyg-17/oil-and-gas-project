@@ -11,7 +11,7 @@ Tabs
   1. Oil PVT       — Rs, Bo, viscosity, compressibility curves + PVT table
   2. Gas PVT       — Gas Z-factor, Bg, μg, ρg from gas correlations
   3. Phase Behavior — PT phase envelope + Binary Pxy diagram
-  4. About          — methodology, sources, references
+  (About/references section preserved in code but not shown as a tab)
 """
 
 import streamlit as st
@@ -27,7 +27,7 @@ from correlations import formation_volume_factor, viscosity, oil_compressibility
 from eos import (
     pseudo_components, build_mixture, characterize_c7plus,
     pr_bubble_point, pr_bubble_point_fugacity, pr_phase_envelope,
-    pxy_diagram_fugacity, PURE_COMPONENTS,
+    find_envelope_T_range, pxy_diagram_fugacity, PURE_COMPONENTS,
 )
 from gas_pvt import gas_pvt_table
 import plotting as _P
@@ -66,6 +66,16 @@ st.markdown("""
     }
     .stTabs [data-baseweb="tab-list"] {
         gap: 8px;
+    }
+
+    /* ── Dataframe column headers: black, bold ── */
+    [data-testid="stDataFrame"] th,
+    [data-testid="stDataFrame"] .dvn-cell-editor-container,
+    [data-testid="stDataFrame"] [class*="cell-header"],
+    [data-testid="glideDataEditor"] .dvn-stack span {
+        color: #000000 !important;
+        font-weight: 700 !important;
+        font-family: 'Times New Roman', Times, serif !important;
     }
 
     /* ── Assumption / source boxes ── */
@@ -143,9 +153,8 @@ def compute_pvt_table_grid(API, GOR, T, gas_SG, region, T_sp, P_sp):
 
 
 @st.cache_data(show_spinner=False)
-def compute_phase_envelope(comp_tuple, T_range=(50.0, 400.0)):
-    """Phase envelope — cache on a hashable key."""
-    # comp_tuple: tuple of (name, z, Tc, Pc, omega, MW) for each component
+def compute_phase_envelope(comp_tuple):
+    """Phase envelope — auto-detects T range, caches on composition key."""
     names  = [r[0] for r in comp_tuple]
     z      = np.array([r[1] for r in comp_tuple])
     Tc     = np.array([r[2] for r in comp_tuple])
@@ -153,7 +162,10 @@ def compute_phase_envelope(comp_tuple, T_range=(50.0, 400.0)):
     omega  = np.array([r[4] for r in comp_tuple])
     MW     = np.array([r[5] for r in comp_tuple])
     mixture = {'names': names, 'z': z, 'Tc': Tc, 'Pc': Pc, 'omega': omega, 'MW': MW}
-    return pr_phase_envelope(mixture, T_range=T_range, n_T=60)
+    T_lo, T_hi, found = find_envelope_T_range(mixture)
+    if not found:
+        T_lo, T_hi = -100.0, 500.0
+    return pr_phase_envelope(mixture, T_range=(T_lo, T_hi), n_T=60)
 
 
 @st.cache_data(show_spinner=False)
@@ -422,7 +434,7 @@ st.divider()
 # TABS
 # ---------------------------------------------------------------------------
 
-tabs = st.tabs(["Oil PVT", "Gas PVT", "Phase Behavior", "About"])
+tabs = st.tabs(["Oil PVT", "Gas PVT", "Phase Behavior"])
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -483,12 +495,12 @@ with tabs[0]:
     st.subheader("PVT Data Table")
 
     df_tbl = pd.DataFrame({
-        'P [psia]'                     : P_arr,
-        'T [°F]'                       : T,
-        'Rs [scf/STB]'                 : np.round(Rs_arr, 2),
-        'Bo [RB/STB]'                  : np.round(Bo_arr, 4),
-        'μo [cp]'                      : np.round(mu_arr, 4),
-        'co [psi⁻¹]'                   : co_arr,
+        'P [psia]'    : P_arr,
+        'T [°F]'      : T,
+        'Rs [scf/STB]': np.round(Rs_arr, 2),
+        'Bo [RB/STB]' : np.round(Bo_arr, 4),
+        'μo [cp]'     : np.round(mu_arr, 4),
+        'co [psi⁻¹]'  : co_arr,
     })
 
     df_display = df_tbl.copy()
@@ -496,7 +508,20 @@ with tabs[0]:
         lambda v: f"{v:.3e}" if not np.isnan(v) else "< Pb"
     )
 
-    st.dataframe(df_display, use_container_width=True, height=350, hide_index=True)
+    st.dataframe(
+        df_display,
+        use_container_width=True,
+        height=350,
+        hide_index=True,
+        column_config={
+            'P [psia]'    : st.column_config.Column(label='P [psia]\nReservoir pressure'),
+            'T [°F]'      : st.column_config.Column(label='T [°F]\nReservoir temp (constant)'),
+            'Rs [scf/STB]': st.column_config.Column(label='Rs [scf/STB]\nDissolved gas in oil'),
+            'Bo [RB/STB]' : st.column_config.Column(label='Bo [RB/STB]\nOil volume ratio'),
+            'μo [cp]'     : st.column_config.Column(label='μo [cp]\nOil viscosity'),
+            'co [psi⁻¹]'  : st.column_config.Column(label='co [psi⁻¹]\nOil compressibility'),
+        }
+    )
 
     # Download CSV
     csv_tbl = df_tbl.copy()
@@ -613,7 +638,7 @@ with tabs[1]:
         return interp1d(P_raw, arr, bounds_error=False, fill_value=np.nan)(P_step)
     Z_step   = _interp(gas_tbl['Z'][valid_mask])
     Bg_step  = _interp(gas_tbl['Bg_ft3'][valid_mask])
-    Bgb_step = _interp(gas_tbl['Bg_bbl'][valid_mask])
+
     rho_step = _interp(gas_tbl['rho_g'][valid_mask])
     mu_step  = _interp(gas_tbl['mu_g'][valid_mask])
     cg_step  = _interp(gas_tbl['cg'][valid_mask])
@@ -622,19 +647,32 @@ with tabs[1]:
         'P [psia]'     : P_step,
         'Z [-]'        : np.round(Z_step, 5),
         'Bg [ft³/scf]' : [f"{v:.4e}" if not np.isnan(v) else "" for v in Bg_step],
-        'Bg [bbl/scf]' : [f"{v:.4e}" if not np.isnan(v) else "" for v in Bgb_step],
+
         'ρg [lb/ft³]'  : np.round(rho_step, 4),
         'μg [cp]'      : np.round(mu_step, 6),
         'cg [psi⁻¹]'   : [f"{v:.4e}" if not np.isnan(v) else "" for v in cg_step],
     })
 
-    st.dataframe(df_gas, use_container_width=True, height=300, hide_index=True)
+    st.dataframe(
+        df_gas,
+        use_container_width=True,
+        height=300,
+        hide_index=True,
+        column_config={
+            'P [psia]'     : st.column_config.Column(label='P [psia]\nReservoir pressure'),
+            'Z [-]'        : st.column_config.Column(label='Z [-]\nGas compressibility factor'),
+            'Bg [ft³/scf]' : st.column_config.Column(label='Bg [ft³/scf]\nGas volume at depth'),
+
+            'ρg [lb/ft³]'  : st.column_config.Column(label='ρg [lb/ft³]\nGas density'),
+            'μg [cp]'      : st.column_config.Column(label='μg [cp]\nGas viscosity'),
+            'cg [psi⁻¹]'   : st.column_config.Column(label='cg [psi⁻¹]\nGas compressibility'),
+        }
+    )
 
     csv_gas = pd.DataFrame({
         'P_psia'         : P_step,
         'Z'              : Z_step,
         'Bg_ft3_per_scf' : Bg_step,
-        'Bg_bbl_per_scf' : Bgb_step,
         'rho_g_lb_ft3'   : rho_step,
         'mu_g_cp'        : mu_step,
         'cg_psi_inv'     : cg_step,
@@ -682,31 +720,51 @@ with tabs[2]:
         st.caption(f"Using: {_comp_label}")
 
         with st.spinner("Building phase envelope..."):
-            env = compute_phase_envelope(_env_mix_tuple, T_range=(50.0, 400.0))
+            env = compute_phase_envelope(_env_mix_tuple)
 
-        T_env   = env['T']
-        bub_mask = ~np.isnan(env['P_bubble'])
-        dew_mask = ~np.isnan(env['P_dew'])
+        T_env    = env['T']
+        bub_eos  = ~np.isnan(env['P_bubble']) &  env['bub_conv']
+        bub_wil  = ~np.isnan(env['P_bubble']) & ~env['bub_conv']
+        dew_eos  = ~np.isnan(env['P_dew'])    &  env['dew_conv']
+        dew_wil  = ~np.isnan(env['P_dew'])    & ~env['dew_conv']
         Tc_mix_F = env['Tc_mix'] - 459.67
 
         fig_env = go.Figure()
-        if bub_mask.any():
+        if bub_eos.any():
             fig_env.add_trace(go.Scatter(
-                x=T_env[bub_mask], y=env['P_bubble'][bub_mask],
+                x=T_env[bub_eos], y=env['P_bubble'][bub_eos],
                 mode='lines+markers',
-                name='Bubble curve',
+                name='Bubble (EOS)',
                 line=dict(color='#1565C0', width=2),
                 marker=dict(size=3),
                 hovertemplate='T = %{x:.1f} °F<br>P_bubble = %{y:,.0f} psia<extra></extra>',
             ))
-        if dew_mask.any():
+        if bub_wil.any():
             fig_env.add_trace(go.Scatter(
-                x=T_env[dew_mask], y=env['P_dew'][dew_mask],
+                x=T_env[bub_wil], y=env['P_bubble'][bub_wil],
                 mode='lines+markers',
-                name='Dew curve',
+                name='Bubble (Wilson approx)',
+                line=dict(color='#90CAF9', width=1.5, dash='dot'),
+                marker=dict(size=3),
+                hovertemplate='T = %{x:.1f} °F<br>P_bubble ≈ %{y:,.0f} psia (Wilson)<extra></extra>',
+            ))
+        if dew_eos.any():
+            fig_env.add_trace(go.Scatter(
+                x=T_env[dew_eos], y=env['P_dew'][dew_eos],
+                mode='lines+markers',
+                name='Dew (EOS)',
                 line=dict(color='#C62828', width=2, dash='dash'),
                 marker=dict(size=3),
                 hovertemplate='T = %{x:.1f} °F<br>P_dew = %{y:,.0f} psia<extra></extra>',
+            ))
+        if dew_wil.any():
+            fig_env.add_trace(go.Scatter(
+                x=T_env[dew_wil], y=env['P_dew'][dew_wil],
+                mode='lines+markers',
+                name='Dew (Wilson approx)',
+                line=dict(color='#EF9A9A', width=1.5, dash='dot'),
+                marker=dict(size=3),
+                hovertemplate='T = %{x:.1f} °F<br>P_dew ≈ %{y:,.0f} psia (Wilson)<extra></extra>',
             ))
         fig_env.add_vline(
             x=float(Tc_mix_F),
@@ -730,12 +788,11 @@ with tabs[2]:
         )
         st.plotly_chart(fig_env, use_container_width=True)
 
-        n_bub = int(bub_mask.sum())
-        n_dew = int(dew_mask.sum())
-        n_T   = len(T_env)
+        n_T = len(T_env)
         st.caption(
-            f"Bubble: {n_bub}/{n_T} converged  |  Dew: {n_dew}/{n_T} converged  "
-            "|  T range: 50–400 °F (fixed)"
+            f"Bubble: {int(bub_eos.sum())}/{n_T} EOS, {int(bub_wil.sum())}/{n_T} Wilson approx  |  "
+            f"Dew: {int(dew_eos.sum())}/{n_T} EOS, {int(dew_wil.sum())}/{n_T} Wilson approx  |  "
+            "T range: 50–400 °F  |  Dotted = Wilson K-value approximation"
         )
 
     # ── Right: Binary Pxy Diagram ───────────────────────────────────────────
@@ -781,20 +838,23 @@ with tabs[2]:
             fig_pxy.update_layout(height=450)
             st.plotly_chart(fig_pxy, use_container_width=True)
 
-            bub_conv = int(np.sum(~np.isnan(pxy_result['P_bubble'])))
-            dew_conv = int(np.sum(~np.isnan(pxy_result['P_dew'])))
+            _n = len(pxy_result['x_A'])
+            _be = int(np.sum(pxy_result['bub_conv']))
+            _bw = int(np.sum(~np.isnan(pxy_result['P_bubble']))) - _be
+            _de = int(np.sum(pxy_result['dew_conv']))
+            _dw = int(np.sum(~np.isnan(pxy_result['P_dew']))) - _de
             st.caption(
-                f"Bubble: {bub_conv}/50 converged  |  "
-                f"Dew: {dew_conv}/50 converged  |  "
-                "P range: 14.7–5000 psia (fixed)."
+                f"Bubble: {_be}/{_n} EOS, {_bw}/{_n} Wilson approx  |  "
+                f"Dew: {_de}/{_n} EOS, {_dw}/{_n} Wilson approx  |  "
+                "Dotted = Wilson K-value approximation"
             )
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# TAB 4 — ABOUT
+# ABOUT / REFERENCES (not rendered as a tab — kept here for reference)
 # ════════════════════════════════════════════════════════════════════════════
 
-with tabs[3]:
+if False:  # noqa — preserved for reference, not shown in UI
     st.subheader("Methodology and References")
 
     st.markdown("""
